@@ -1,0 +1,52 @@
+[Unit]
+Description=ARMEDIAS AI — Telegram Automation Hub
+Documentation=https://github.com/itsmearyanabc/camel-telegram-tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=armedias
+Group=armedias
+WorkingDirectory=/opt/armedias
+
+# Secrets live here, never in this unit file.
+EnvironmentFile=/opt/armedias/.env
+
+# Bind to loopback only — nginx is the sole public entry point.
+#
+# --workers 1 is MANDATORY, not a tuning choice. Every Telegram session,
+# worker, queue and campaign lives in process memory. A second worker would
+# hold its own copy of all of it and forward every message twice.
+ExecStart=/opt/armedias/venv/bin/gunicorn \
+    --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
+    --workers 1 \
+    --bind 127.0.0.1:5001 \
+    --timeout 120 \
+    --graceful-timeout 30 \
+    --log-level info \
+    --access-logfile - \
+    --error-logfile - \
+    app:app
+
+# SIGTERM lets app.py's atexit handler flush state to Supabase and close
+# Telegram sessions cleanly. Give it room before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=armedias
+
+# Hardening — the app only ever writes inside its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/armedias
+
+[Install]
+WantedBy=multi-user.target
