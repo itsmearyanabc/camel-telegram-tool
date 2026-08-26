@@ -25,6 +25,25 @@ die()  { echo "${RED}error:${OFF} $*" >&2; exit 1; }
 
 say "Deploying ARMEDIAS to ${BLD}${DOMAIN}${OFF}"
 
+# ── 0. Find a free loopback port — 5001 may belong to another project ──
+APP_PORT=""
+for p in $(seq 5001 5040); do
+    if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then
+        APP_PORT="$p"; break
+    fi
+done
+[[ -n "$APP_PORT" ]] || die "no free port in 5001-5040"
+if [[ "$APP_PORT" != "5001" ]]; then
+    warn "port 5001 is taken by another service; using $APP_PORT instead"
+else
+    ok "using port $APP_PORT"
+fi
+
+# ── 0b. Refuse to hijack a subdomain another site already serves ──
+if grep -rqs "server_name.*${DOMAIN}" /etc/nginx/sites-enabled/ 2>/dev/null; then
+    die "$DOMAIN is already served by an existing nginx site. Resolve that first — refusing to collide."
+fi
+
 # ── 1. Check DNS actually points here before we bother with certificates ──
 say "Checking DNS"
 SERVER_IP="$(curl -fsS --max-time 10 https://api.ipify.org || echo '')"
@@ -102,7 +121,7 @@ SUPABASE_URL=
 SUPABASE_KEY=
 
 LOG_LEVEL=INFO
-PORT=5001
+PORT=${APP_PORT}
 EOF
     NEEDS_ENV=1
     ok ".env created with a generated SECRET_KEY"
@@ -113,27 +132,40 @@ chmod 600 "$APP_DIR/.env"
 
 # ── 7. systemd ──
 say "Installing systemd service"
-install -m 644 "$APP_DIR/deploy/armedias.service" /etc/systemd/system/armedias.service
+sed "s/127.0.0.1:5001/127.0.0.1:${APP_PORT}/" "$APP_DIR/deploy/armedias.service"     > /etc/systemd/system/armedias.service
+chmod 644 /etc/systemd/system/armedias.service
 systemctl daemon-reload
 systemctl enable -q armedias
 ok "service installed"
 
 # ── 8. nginx ──
 say "Configuring nginx"
-sed "s/__DOMAIN__/${DOMAIN}/g" "$APP_DIR/deploy/nginx-armedias.conf" \
-    > /etc/nginx/sites-available/armedias
+sed -e "s/__DOMAIN__/${DOMAIN}/g" \
+    -e "s/127\.0\.0\.1:5001/127.0.0.1:${APP_PORT}/" \
+    "$APP_DIR/deploy/nginx-armedias.conf" > /etc/nginx/sites-available/armedias
 ln -sf /etc/nginx/sites-available/armedias /etc/nginx/sites-enabled/armedias
-rm -f /etc/nginx/sites-enabled/default
-nginx -t
+# NOTE: the default site is deliberately left in place. On a shared VPS it may
+# be a real site belonging to another project, and removing it is not ours to do.
+if ! nginx -t; then
+    rm -f /etc/nginx/sites-enabled/armedias
+    die "nginx config test failed — our site was removed again, nothing else was touched"
+fi
 systemctl reload nginx
-ok "nginx configured for $DOMAIN"
+ok "nginx site added for $DOMAIN (existing sites untouched)"
 
 # ── 9. Firewall ──
-say "Configuring firewall"
-ufw allow OpenSSH   >/dev/null 2>&1 || true
-ufw allow 'Nginx Full' >/dev/null 2>&1 || true
-ufw --force enable  >/dev/null 2>&1 || true
-ok "ssh + http/https allowed; port 5001 stays private"
+say "Checking firewall"
+if command -v ufw >/dev/null && ufw status 2>/dev/null | head -1 | grep -qi "^Status: active"; then
+    # Already on — only ever ADD rules.
+    ufw allow OpenSSH      >/dev/null 2>&1 || true
+    ufw allow 'Nginx Full' >/dev/null 2>&1 || true
+    ok "ufw already active; allowed ssh + http/https"
+else
+    warn "ufw is inactive — deliberately NOT enabling it."
+    warn "Turning a firewall on here could block ports your other production"
+    warn "services rely on. Enable it yourself once you have listed their rules."
+fi
+ok "port $APP_PORT is bound to loopback only and is not publicly reachable"
 
 # ── 10. Start ──
 say "Starting application"
@@ -150,7 +182,10 @@ fi
 # ── 11. TLS ──
 if [[ -n "$DOMAIN_IP" && ( -z "$SERVER_IP" || "$DOMAIN_IP" == "$SERVER_IP" ) ]]; then
     say "Requesting Let's Encrypt certificate"
-    if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
+    # --cert-name scopes this to our domain so certbot cannot rewrite or
+    # renew certificates belonging to the other sites on this box.
+    if certbot --nginx -d "$DOMAIN" --cert-name "$DOMAIN" \
+               --non-interactive --agree-tos \
                --register-unsafely-without-email --redirect; then
         ok "HTTPS enabled (auto-renews via certbot timer)"
         SCHEME=https

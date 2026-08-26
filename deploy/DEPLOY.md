@@ -2,6 +2,34 @@
 
 Ubuntu 22.04 or 24.04. Takes about ten minutes, most of it waiting for DNS.
 
+## Running alongside other projects
+
+This is written for a VPS that already hosts other production services. The
+installer is strictly additive:
+
+- **It never enables your firewall.** If `ufw` is inactive it stays inactive and
+  says so. Turning a firewall on where other services are running would block
+  every port not explicitly allowed and could take them offline. If `ufw` is
+  already active it only *adds* allow rules for SSH and HTTP/HTTPS.
+- **It never removes another nginx site**, including the default one — that may
+  belong to someone else's project.
+- **It picks a free port.** If 5001 is taken it scans up to 5040 and uses the
+  first free one, wiring that port into both the systemd unit and the nginx
+  proxy. It binds to loopback only, so nothing new is exposed publicly.
+- **It refuses to hijack a subdomain** already served by an existing nginx site,
+  and aborts instead of colliding.
+- **It rolls back its own nginx site** if `nginx -t` fails, so a bad config can
+  never break the reload for your other sites.
+- **certbot is scoped with `--cert-name`** to this domain only, so it cannot
+  rewrite or renew certificates belonging to your other sites.
+
+Run `preflight.sh` first — it is read-only and reports exactly what is already
+on the box and what would conflict:
+
+```bash
+sudo bash preflight.sh telegrambot.yourdomain.com
+```
+
 ---
 
 ## 1. Point the subdomain at the VPS
