@@ -24,6 +24,10 @@
     <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
     Group Monitor
   </div>
+  <div class="nav-item" data-tab="message-bot">
+    <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 4v-4z"/></svg>
+    Message Bot
+  </div>
   <div class="nav-item" data-tab="logs">
     <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
     System Logs
@@ -74,6 +78,129 @@
 
       <div class="grid" id="groups-grid">
         <!-- Rendered via app.js -->
+      </div>
+    </div>
+
+    <!-- ═══ MESSAGE BOT TAB ═══ -->
+    <div id="message-bot-tab" class="tab">
+      <div class="stats">
+        <div class="stat-card"><div class="stat-label">Users in Pool</div><div class="stat-value" id="mbTotal">0</div></div>
+        <div class="stat-card"><div class="stat-label">Reachable</div><div class="stat-value" id="mbReady">0</div></div>
+        <div class="stat-card"><div class="stat-label">Awaiting Start</div><div class="stat-value" id="mbPending">0</div></div>
+        <div class="stat-card"><div class="stat-label">Messages Sent</div><div class="stat-value" id="mbSent">0</div></div>
+      </div>
+
+      <!-- BOT CONNECTION -->
+      <div class="card mb-botbar" id="mb-botbar"></div>
+
+      <div class="mb-split">
+        <!-- ═══ COMPOSE ═══ -->
+        <div class="card">
+          <div class="mb-head"><h2>Compose Message</h2></div>
+
+          <div class="fg">
+            <label>Message</label>
+            <textarea id="mb-text" class="input" rows="5" placeholder="Write your message... (also used as the caption when you attach a file)"></textarea>
+          </div>
+
+          <div class="fg">
+            <label>Attach File, Photo or Video</label>
+            <div class="mb-drop" id="mb-drop">
+              <input type="file" id="mb-file" style="display:none">
+              <div id="mb-drop-idle">
+                <i class="fas fa-cloud-arrow-up" style="font-size:1.3rem;color:var(--text3)"></i>
+                <p style="margin:6px 0 0;font-size:.8rem;color:var(--text2)">Click to choose a file — photo, video, audio or document</p>
+                <p style="margin:2px 0 0;font-size:.7rem;color:var(--text3)">Up to 50 MB (Telegram's bot upload limit)</p>
+              </div>
+              <div id="mb-drop-filled" class="hidden">
+                <div class="mb-file-chip">
+                  <i class="fas fa-paperclip"></i>
+                  <span id="mb-file-name"></span>
+                  <span id="mb-file-meta" class="mb-file-meta"></span>
+                  <button class="btn btn-d btn-sm" onclick="clearAttachment(event)"><i class="fas fa-xmark"></i></button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="fg">
+            <label>Website Link <span style="font-weight:400;color:var(--text3)">(optional)</span></label>
+            <input type="url" id="mb-link" class="input" placeholder="https://yoursite.com">
+          </div>
+          <div class="row2">
+            <div class="fg">
+              <label>Link Button Text</label>
+              <input type="text" id="mb-link-label" class="input" placeholder="Open Link">
+            </div>
+            <div class="fg">
+              <label>Show Link As</label>
+              <select id="mb-link-mode" class="input">
+                <option value="button">Tappable button</option>
+                <option value="text">Plain text in message</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="fg">
+            <label>Delay Between Messages — <span id="mb-delay-val" class="mb-delay-val">1.5s</span></label>
+            <input type="range" id="mb-delay" min="0.5" max="15" step="0.5" value="1.5" class="mb-range" oninput="updateDelayLabel()">
+            <div class="hint">A random extra pause is added on top so the pattern is not machine-regular. Higher is safer against Telegram rate limits.</div>
+          </div>
+
+          <div id="mb-progress" class="mb-progress hidden">
+            <div class="pbar"><div class="pbar-fill" id="mb-pbar" style="width:0%"></div></div>
+            <div class="mb-progress-txt"><span id="mb-progress-label">Sending...</span><span id="mb-progress-count">0 / 0</span></div>
+          </div>
+
+          <div style="display:flex;gap:10px;margin-top:16px">
+            <button class="btn btn-p" style="flex:2" id="mb-send-btn" onclick="sendBotMessage()">
+              <i class="fas fa-paper-plane"></i> Send to Selected
+            </button>
+            <button class="btn btn-d" id="mb-stop-btn" style="display:none" onclick="stopBotSend()">
+              <i class="fas fa-stop"></i> Stop
+            </button>
+          </div>
+        </div>
+
+        <!-- ═══ USER DATABASE POOL ═══ -->
+        <div class="card">
+          <div class="mb-head">
+            <h2>User Database Pool</h2>
+            <span class="mb-sub" id="mb-pool-sub">0 users saved</span>
+          </div>
+
+          <div class="fg">
+            <label>Add Users</label>
+            <textarea id="mb-add-raw" class="input" rows="3"
+              placeholder="Paste usernames or IDs — @alice, bob, 123456789&#10;Separate with new lines, commas or spaces"></textarea>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button class="btn btn-p btn-sm" style="flex:1" onclick="addRecipients()"><i class="fas fa-plus"></i> Add to Pool</button>
+              <button class="btn btn-s btn-sm" onclick="resolveRecipients()" title="Look up numeric IDs for @usernames using a logged-in account"><i class="fas fa-id-badge"></i> Resolve IDs</button>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:8px;margin:14px 0 10px">
+            <input type="text" id="mb-search" class="input" placeholder="Search pool..." style="flex:1" oninput="debouncedPoolSearch()">
+            <button class="btn btn-s btn-sm" onclick="toggleSelectAll()" id="mb-selectall-btn">Select All</button>
+            <button class="btn btn-d btn-sm" onclick="deleteSelected()"><i class="fas fa-trash"></i> Delete</button>
+          </div>
+
+          <div class="gm-table-wrap mb-pool-wrap">
+            <table class="gm-table">
+              <thead>
+                <tr>
+                  <th style="width:34px"><input type="checkbox" id="mb-check-all" onclick="toggleSelectAll()"></th>
+                  <th>Username</th>
+                  <th>Name</th>
+                  <th>Telegram ID</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="mb-pool-rows"></tbody>
+            </table>
+          </div>
+          <p class="mb-note" id="mb-pool-note"></p>
+        </div>
       </div>
     </div>
 
@@ -225,6 +352,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script src="{{ url_for('static', filename='app.js') }}?v=2.0"></script>
 <script src="{{ url_for('static', filename='group_monitor.js') }}?v=1.0"></script>
+<script src="{{ url_for('static', filename='message_bot.js') }}?v=1.0"></script>
 <script>
   // Simple Tab Logic
   document.querySelectorAll('.nav-item[data-tab]').forEach(item => {
@@ -238,10 +366,12 @@
 
       // Topbar actions follow the active tab
       const onGroups = tabId === 'group-monitor';
-      document.getElementById('btnAddAccount').style.display = onGroups ? 'none' : 'inline-flex';
+      const onBot = tabId === 'message-bot';
+      document.getElementById('btnAddAccount').style.display = (onGroups || onBot) ? 'none' : 'inline-flex';
       document.getElementById('btnAddGroup').style.display = onGroups ? 'inline-flex' : 'none';
       document.getElementById('btnSyncGroups').style.display = onGroups ? 'inline-flex' : 'none';
       if (onGroups && typeof loadGroups === 'function') loadGroups();
+      if (onBot && typeof loadBot === 'function') loadBot();
     });
   });
 </script>

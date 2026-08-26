@@ -15,8 +15,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from utils.logger import logger
 from core.services.config_service import config_service
 from core.services.group_store import group_store
+from core.services.bot_store import bot_store
 from core.bot_manager import BotManager
 from core.group_monitor import GroupMonitorManager
+from core.message_bot import MessageBot, kind_for, MAX_UPLOAD_MB
 from pyrogram import Client
 from pyrogram.errors import (
     AuthKeyUnregistered, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -28,6 +30,7 @@ from pyrogram.errors import (
 # ──────────────────────────────────────────────
 bot_manager = BotManager()
 group_monitor = GroupMonitorManager(bot_manager)
+message_bot = MessageBot(bot_manager)
 _BOT_LOOP = asyncio.new_event_loop()
 # UNIFIED SECRET KEY
 SECRET_KEY = os.environ.get("SECRET_KEY", "ARMEDIAS_PROD_STABLE_2026")
@@ -66,6 +69,13 @@ def _init_app():
         asyncio.run_coroutine_threadsafe(group_monitor.start_background_sync(), _BOT_LOOP).result(timeout=15)
     except Exception as e:
         logger.warning(f"👁 Group monitor startup skipped: {e}")
+
+    # Message bot: resume listening for users who press Start.
+    try:
+        if message_bot.info().get("connected"):
+            message_bot.start_polling()
+    except Exception as e:
+        logger.warning(f"🤖 Message bot startup skipped: {e}")
 
     _init_complete = True
     logger.info("🚀 System initialization complete. Bot is ready.")
@@ -577,6 +587,147 @@ def register_routes(app, socketio):
             mimetype="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+    # ──────────────────────────────────────────────
+    # MESSAGE BOT
+    # ──────────────────────────────────────────────
+    UPLOAD_DIR = os.path.join("data", "uploads")
+
+    @app.route("/api/bot/state", methods=["GET"])
+    @token_required
+    def bot_state():
+        return jsonify({
+            "status": "success",
+            "bot": message_bot.info(),
+            "recipients": bot_store.list_recipients(request.args.get("search", "").strip()),
+            "totals": bot_store.totals(),
+            "send_state": message_bot.send_state,
+            "history": bot_store.recent_sends(40),
+        })
+
+    @app.route("/api/bot/connect", methods=["POST"])
+    @token_required
+    def bot_connect():
+        token = (request.get_json() or {}).get("token", "")
+        return jsonify(message_bot.verify_and_save(token))
+
+    @app.route("/api/bot/disconnect", methods=["POST"])
+    @token_required
+    def bot_disconnect():
+        return jsonify(message_bot.disconnect())
+
+    @app.route("/api/bot/recipients/add", methods=["POST"])
+    @token_required
+    def bot_recipients_add():
+        raw = (request.get_json() or {}).get("raw", "")
+        if not str(raw).strip():
+            return jsonify({"status": "error", "message": "Paste at least one username or user ID"}), 400
+        return jsonify(message_bot.add_bulk(raw))
+
+    @app.route("/api/bot/recipients/delete", methods=["POST"])
+    @token_required
+    def bot_recipients_delete():
+        ids = (request.get_json() or {}).get("ids", [])
+        try:
+            ids = [int(i) for i in ids]
+        except Exception:
+            return jsonify({"status": "error", "message": "Bad recipient ids"}), 400
+        removed = bot_store.delete_recipients(ids)
+        return jsonify({"status": "success", "removed": removed})
+
+    @app.route("/api/bot/recipients/resolve", methods=["POST"])
+    @token_required
+    def bot_recipients_resolve():
+        """Fill numeric IDs for username-only rows using a logged-in user account."""
+        try:
+            return jsonify(run_async(message_bot.resolve_usernames()))
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/bot/upload", methods=["POST"])
+    @token_required
+    def bot_upload():
+        """Accept a file from the browser and hold it for the next send."""
+        f = request.files.get("file")
+        if not f or not f.filename:
+            return jsonify({"status": "error", "message": "No file received"}), 400
+
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+        # Prune attachments older than a day so uploads don't fill the disk.
+        cutoff = time.time() - 86400
+        for old in os.listdir(UPLOAD_DIR):
+            p = os.path.join(UPLOAD_DIR, old)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+
+        safe = "".join(c if (c.isalnum() or c in "._- ") else "_" for c in os.path.basename(f.filename))
+        path = os.path.join(UPLOAD_DIR, f"{int(time.time())}_{safe}")
+        f.save(path)
+
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_MB:
+            os.remove(path)
+            return jsonify({
+                "status": "error",
+                "message": f"File is {size_mb:.1f} MB — Telegram caps bot uploads at {MAX_UPLOAD_MB} MB",
+            }), 400
+
+        return jsonify({
+            "status": "success", "path": path, "name": safe,
+            "size_mb": round(size_mb, 2), "kind": kind_for(path),
+        })
+
+    @app.route("/api/bot/send", methods=["POST"])
+    @token_required
+    def bot_send():
+        d = request.get_json() or {}
+        try:
+            ids = [int(i) for i in d.get("recipient_ids", [])]
+        except Exception:
+            return jsonify({"status": "error", "message": "Bad recipient ids"}), 400
+
+        def _progress(state):
+            try:
+                with app.app_context():
+                    socketio.emit("bot_progress", state, namespace="/")
+            except Exception:
+                pass
+
+        return jsonify(message_bot.start_campaign(
+            recipient_ids=ids,
+            text=d.get("text", ""),
+            file_path=d.get("file_path", ""),
+            link=d.get("link", "").strip(),
+            link_label=d.get("link_label", "").strip(),
+            link_as_button=bool(d.get("link_as_button", True)),
+            delay=max(0.0, float(d.get("delay", 1.5))),
+            on_progress=_progress,
+        ))
+
+    @app.route("/api/bot/stop", methods=["POST"])
+    @token_required
+    def bot_stop():
+        return jsonify(message_bot.stop_campaign())
+
+    def _bot_status_worker():
+        """Push message bot state to the dashboard."""
+        while True:
+            try:
+                with app.app_context():
+                    socketio.emit("bot_update", {
+                        "bot": message_bot.info(),
+                        "totals": bot_store.totals(),
+                        "send_state": message_bot.send_state,
+                    }, namespace="/")
+            except Exception as e:
+                logger.error(f"Bot status update error: {e}")
+            time.sleep(5)
+
+    threading.Thread(target=_bot_status_worker, daemon=True).start()
 
     def _group_status_worker():
         """Push group monitor state to the dashboard on the same cadence as accounts."""

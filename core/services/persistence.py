@@ -215,8 +215,32 @@ class PersistenceManager:
                     pass
         return ok
 
+    def backup_bot_db(self):
+        """Push the message bot database (token + recipients) to Supabase."""
+        local = "data/message_bot.db"
+        if not os.path.exists(local):
+            return False
+        try:
+            from core.services.bot_store import bot_store
+            bot_store.checkpoint()
+        except Exception as e:
+            logger.warning(f"☁️ Bot DB checkpoint skipped: {e}")
+        return self._upload("data/message_bot.db", local)
+
+    def restore_bot_db(self):
+        """Pull the message bot database from Supabase."""
+        ok = self._download("data/message_bot.db", "data/message_bot.db")
+        if ok:
+            for sidecar in ("data/message_bot.db-wal", "data/message_bot.db-shm"):
+                try:
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
+                except Exception:
+                    pass
+        return ok
+
     def restore_all(self):
-        """Full restore: config + all sessions + group monitor DB. Called on startup."""
+        """Full restore: config + sessions + group monitor DB + message bot DB."""
         if not self.enabled:
             return
         os.makedirs("sessions", exist_ok=True)
@@ -226,6 +250,7 @@ class PersistenceManager:
         self.restore_config()
         self.restore_all_sessions()
         self.restore_group_db()
+        self.restore_bot_db()
         logger.info("☁️ Cloud restore complete.")
 
 

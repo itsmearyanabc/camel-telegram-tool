@@ -25,6 +25,7 @@ class BotWorker:
     cooldown_until = 0
     current_msg_id = None
     current_from_chat = None
+    last_dispatch_time = None
     def __init__(self, client: Client, phone: str, clean_phone: str, 
                  targets: List[str], source_channel: str, loop_interval: int,
                  global_semaphore: asyncio.Semaphore, msg_delay: int = 5):
@@ -50,6 +51,7 @@ class BotWorker:
         self.current_msg_id = None
         self.current_from_chat = None
         self.cooldown_until = 0
+        self.last_dispatch_time = None
         
         # Idempotency & Coordination
         self.last_processed_msg = None
@@ -227,6 +229,7 @@ class BotWorker:
                     success, err = await self._send_msg(target)
                 
                 if success:
+                    self.last_dispatch_time = time.time()
                     await self.progress.mark_success(target)
                 else:
                     logger.error(f"[{self.phone}] Delivery to {target} failed: {err}")
@@ -294,5 +297,6 @@ class BotWorker:
             "last_action": stats["last_action"], "progress": stats["progress"],
             "targets_count": len(self.targets), "source_channel": self.source_channel,
             "loop_interval": self.loop_interval, "is_loop_active": self.is_running,
-            "cooldown_remaining": cd_rem, "msg_delay": self.msg_delay
+            "cooldown_remaining": cd_rem, "msg_delay": self.msg_delay,
+            "last_dispatch_time": getattr(self, "last_dispatch_time", None)
         }

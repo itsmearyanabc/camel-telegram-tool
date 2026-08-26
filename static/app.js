@@ -205,7 +205,15 @@ function updateCardContent(card, acc) {
         loopBtn.style.display = 'none';
         logoutBtn.style.display = 'none';
     } else {
-        dispatchBtn.style.display = 'none';
+        // Manual re-dispatch of the last source message — previously unreachable
+        // because this button was hidden once an account authenticated.
+        dispatchBtn.style.display = 'inline-flex';
+        dispatchBtn.style.flex = '2';
+        dispatchBtn.className = 'btn btn-p btn-sm btn-dispatch';
+        dispatchBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Now';
+        dispatchBtn.title = 'Re-forward the last source message to all targets now';
+        dispatchBtn.onclick = () => manualDispatch(acc.clean_phone);
+
         loopBtn.style.display = 'inline-flex';
         loopBtn.style.flex = '2';
         loopBtn.className = `btn btn-sm btn-loop ${acc.is_running ? 'btn-d' : 'btn-p'}`;

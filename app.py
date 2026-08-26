@@ -25,6 +25,10 @@ app = Flask(__name__)
 # UNIFIED SECRET KEY
 app.secret_key = os.environ.get("SECRET_KEY", "ARMEDIAS_PROD_STABLE_2026")
 
+# Message bot uploads: Telegram caps bot file uploads at 50 MB, so reject
+# anything larger at the door rather than buffering it first.
+app.config["MAX_CONTENT_LENGTH"] = 55 * 1024 * 1024
+
 # Enable CORS
 CORS(app)
 
@@ -53,6 +57,7 @@ def graceful_shutdown():
             for p_clean in list(bot_manager.workers.keys()):
                 persistence.backup_session(p_clean)
             persistence.backup_group_db()
+            persistence.backup_bot_db()
             logger.info("☁️ State backed up to Supabase.")
         except Exception as e:
             logger.warning(f"☁️ Pre-shutdown backup failed: {e}")

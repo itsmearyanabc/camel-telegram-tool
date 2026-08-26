@@ -35,16 +35,19 @@ api/routes.py                  ALL routes + auth + the dedicated asyncio loop th
 core/bot_manager.py            Orchestrator; owns Dict[clean_phone -> BotWorker]
 core/bot_worker.py             Per-account engine: monitor, queue, dispatch, retry
 core/group_monitor.py          Group Monitor engine: live handlers + roster diff sync
+core/message_bot.py            Message Bot engine: Bot API sends + /start capture
 core/services/
   config_service.py            config.json load/atomic-save (+ Supabase sync on save)
   loop_manager.py              start/stop a single asyncio.Task, cancels the previous
   progress_tracker.py          lock-guarded sent/failed/total counters
   group_store.py               SQLite store for monitored groups / members / events
+  bot_store.py                 SQLite store for bot token / user pool / send log
   persistence.py               Supabase Storage REST backup of config + sessions + group DB
 utils/logger.py                rotating logs/bot.log, UTF-8 forced (Windows-safe)
 utils/config_loader.py         LEGACY duplicate of config_service — see section 6
 templates/ static/             vanilla-JS dashboard, DOM-diffed cards
 static/group_monitor.js        Group Monitor tab controller (loads after app.js)
+static/message_bot.js          Message Bot tab controller (loads after app.js)
 ```
 
 ### The threading model — the single most important thing here
@@ -164,8 +167,12 @@ phones synthesised from `config.json` + session-file existence.
   requires a restart.
 - Concurrency ceiling is `BotManager.global_semaphore = asyncio.Semaphore(3)` — at most 3
   accounts sending at any instant, across all workers.
-- `to_dict()` never sets `last_dispatch_time`, which the UI reads, so the card's "Last Sent"
-  column always shows `Never`.
+- ~~`last_dispatch_time` never set~~ — fixed 2026-08-27; the worker now stamps it on each
+  successful forward, so "Last Sent" shows a real time.
+- ~~Dispatch button unreachable~~ — fixed 2026-08-27; it was created then hidden for
+  authenticated accounts, leaving `/api/session/dispatch` with no UI path. Now "Send Now".
+- ~~`.hidden` CSS class was never defined~~ — fixed 2026-08-27. The OTP modal's step logic
+  toggled a class with no rule behind it, so all three login steps rendered at once.
 
 ---
 
@@ -217,7 +224,59 @@ WS   group_update (server→client, 5s)
 
 ---
 
-## 8. Anti-flood behaviour
+## 8. Message Bot
+
+Third dashboard tab. Sends 1-to-1 messages, files, photos, videos and website links
+to a permanent **User Database Pool** through a Telegram Bot.
+
+Storage: `data/message_bot.db` (SQLite) — `bot_config`, `recipients`, `send_log`.
+Backed up to Supabase alongside the group DB.
+
+### The constraint that shapes the whole feature
+
+**A bot cannot open a conversation with a person.** The person must press Start on the
+bot first, or `sendMessage` returns *"Forbidden: bot can't initiate conversation with a
+user"*. There is also **no Bot API method to turn an @username into a chat_id**. Neither
+of these is a bug to be fixed — they are Telegram platform rules.
+
+Three things make the pool usable in spite of that:
+
+1. **`getUpdates` poller** (background thread) — anyone who presses Start or messages the
+   bot is auto-added to the pool and flipped to `ready`. This is what actually makes
+   delivery possible, so the poller resumes on boot whenever a token is stored.
+2. **Username resolution** via a logged-in Pyrogram *user* account fills in numeric IDs
+   for username-only rows. It completes the record; it does **not** grant permission.
+3. **Explicit per-recipient status** — `pending` (needs Start) / `ready` / `blocked` /
+   `failed` — so the UI states the reason instead of failing silently.
+
+Recipients dedupe on user_id first, then username, so the same person pasted twice in
+different forms collapses into one row. They persist until explicitly deleted.
+
+### Rate-limit safety
+
+Configurable delay (0.5–15s) with random jitter on top, so the cadence is not
+machine-regular. Telegram's `retry_after` from a 429 is honoured exactly — the send
+sleeps that long and retries the recipient once. Campaigns run on a worker thread and
+can be stopped mid-flight.
+
+Uploads: capped at 50 MB (Telegram's bot limit; `MAX_CONTENT_LENGTH` rejects >55 MB at
+the door). `kind_for()` picks sendPhoto/sendVideo/sendAudio/sendDocument for the best
+in-chat rendering. Files land in `data/uploads/` and are pruned after 24h.
+
+Links render either as a tappable inline keyboard button or appended as plain text.
+
+```
+GET  /api/bot/state                 bot info + pool + totals + send state + history
+POST /api/bot/connect | disconnect
+POST /api/bot/recipients/add | delete | resolve
+POST /api/bot/upload                multipart, returns {path, kind, size_mb}
+POST /api/bot/send | stop
+WS   bot_update (5s) · bot_progress (per recipient)
+```
+
+---
+
+## 9. Anti-flood behaviour
 
 `_send_msg` retries 3x with exponential backoff (2s, 4s). `FloodWait` sets
 `cooldown_until = monotonic() + e.value + 5` and the queue processor blocks on it, ticking a
