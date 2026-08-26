@@ -1,0 +1,10 @@
+{
+    "api_id": "",
+    "api_hash": "",
+    "phones": "",
+    "source_channel": "",
+    "loop_interval": 15,
+    "msg_delay": 5,
+    "targets": [],
+    "account_settings": {}
+}

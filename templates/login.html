@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — ARMEDIAS AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root { --primary: #6366f1; --bg: #f8fafc; --text: #0f172a; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); display: flex; align-items: center; justify-content: center; height: 100vh; color: var(--text); }
+        .login-card { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+        .logo { font-size: 1.5rem; font-weight: 800; color: var(--primary); margin-bottom: 8px; letter-spacing: -0.5px; }
+        h1 { font-size: 1.25rem; margin-bottom: 24px; color: #1e293b; }
+        .fg { margin-bottom: 16px; text-align: left; }
+        label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 6px; color: #64748b; }
+        input { width: 100%; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 1rem; transition: border 0.2s; }
+        input:focus { outline: none; border-color: var(--primary); }
+        button { width: 100%; padding: 12px; background: var(--primary); color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 8px; transition: opacity 0.2s; }
+        button:hover { opacity: 0.9; }
+        .error { color: #ef4444; font-size: 0.875rem; margin-bottom: 16px; background: #fef2f2; padding: 10px; border-radius: 6px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="logo">ARMEDIAS AI</div>
+        <h1>Control Panel Login</h1>
+        
+        <div id="error-box" class="error"></div>
+
+        <form id="login-form">
+            <div class="fg">
+                <label>Username</label>
+                <input type="text" id="username" placeholder="admin" required>
+            </div>
+            <div class="fg">
+                <label>Password</label>
+                <input type="password" id="password" placeholder="••••••••" required>
+            </div>
+            <button type="submit" id="login-btn">Login to Dashboard</button>
+        </form>
+    </div>
+
+    <script>
+        document.getElementById('login-form').onsubmit = async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('login-btn');
+            const err = document.getElementById('error-box');
+            
+            btn.disabled = true;
+            btn.textContent = 'Authenticating...';
+            err.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('username').value,
+                        password: document.getElementById('password').value
+                    })
+                });
+
+                const data = await res.json();
+
+                if (res.status === 200 && data.token) {
+                    localStorage.setItem('token', data.token);
+                    window.location.href = '/';
+                } else {
+                    err.textContent = data.message || 'Invalid credentials';
+                    err.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Login to Dashboard';
+                }
+            } catch (e) {
+                err.textContent = 'Connection error. Is the server running?';
+                err.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Login to Dashboard';
+            }
+        };
+
+        // If already logged in, redirect home
+        if (localStorage.getItem('token')) {
+            window.location.href = '/';
+        }
+    </script>
+</body>
+</html>

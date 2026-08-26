@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ARMEDIAS — Control Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+  <div class="brand"><div class="brand-icon">A</div>ARMEDIAS</div>
+  <div class="nav-item active" data-tab="dashboard">
+    <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
+    Dashboard
+  </div>
+  <div class="nav-item" onclick="openGlobalSettings()">
+    <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
+    Global Config
+  </div>
+  <div class="nav-item" data-tab="logs">
+    <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+    System Logs
+  </div>
+  <div style="margin-top:auto">
+    <a href="javascript:void(0)" onclick="adminLogout()" class="nav-item">
+      <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+      Sign Out
+    </a>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+  <div class="topbar">
+    <h1 id="pageTitle">Dashboard</h1>
+    <div class="controls">
+      <button class="btn btn-p" onclick="promptAddAccount()">+ Add New Account</button>
+    </div>
+  </div>
+
+  <div class="content">
+
+    <!-- ═══ DASHBOARD TAB ═══ -->
+    <div id="dashboard-tab" class="tab active">
+      <div class="stats">
+        <div class="stat-card"><div class="stat-label">Total Accounts</div><div class="stat-value" id="statTotal">0</div></div>
+        <div class="stat-card"><div class="stat-label">Active Loops</div><div class="stat-value" id="statActive">0</div></div>
+        <div class="stat-card"><div class="stat-label">Messages Sent</div><div class="stat-value" id="statSent">0</div></div>
+        <div class="stat-card"><div class="stat-label">Errors</div><div class="stat-value" id="statErrors">0</div></div>
+      </div>
+
+      <div class="grid" id="sessions-grid">
+        <!-- Rendered via app.js -->
+      </div>
+    </div>
+
+    <!-- ═══ LOGS TAB ═══ -->
+    <div id="logs-tab" class="tab">
+      <div class="card" style="height: calc(100vh - 200px); display:flex; flex-direction:column">
+        <div style="display:flex; justify-content:space-between; margin-bottom:12px">
+          <h2 style="font-size:1rem; font-weight:600">Global System Logs</h2>
+          <button class="btn btn-s btn-sm" onclick="refreshLogs()">Refresh</button>
+        </div>
+        <pre id="log-content" style="flex:1; background:#f8f9fa; border:1px solid var(--border); padding:16px; border-radius:8px; font-family:monospace; font-size:.85rem; overflow-y:auto; white-space:pre-wrap">Loading...</pre>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- GLOBAL SETTINGS MODAL -->
+<div class="overlay" id="global-settings-modal">
+  <div class="modal" style="max-width: 500px; text-align: left;">
+    <h3>Global Configuration</h3>
+    <p style="color:var(--text2); font-size:.85rem; margin-bottom:16px">Manage Telegram API credentials and default settings.</p>
+    <div class="fg"><label>API ID</label><input type="text" id="global-api-id" class="input" value="{{ config.api_id }}"></div>
+    <div class="fg"><label>API Hash</label><input type="text" id="global-api-hash" class="input" value="{{ config.api_hash }}"></div>
+    <div class="fg"><label>Default Source Channel</label><input type="text" id="global-source" class="input" value="{{ config.source_channel }}"></div>
+    <div class="fg"><label>Default Interval (Min)</label><input type="number" id="global-interval" class="input" value="{{ config.loop_interval or 15 }}"></div>
+    <div class="fg"><label>Delay Between Messages (Seconds)</label><input type="number" id="global-delay" class="input" value="{{ config.msg_delay or 5 }}"></div>
+    <div style="display:flex; gap:10px; margin-top:20px">
+      <button class="btn btn-s" onclick="closeModal()"><i class="fas fa-arrow-left"></i> Back</button>
+      <button class="btn btn-p" onclick="saveGlobalSettings()">Save Global Config</button>
+    </div>
+  </div>
+</div>
+
+<!-- SESSION SETTINGS MODAL -->
+<div class="overlay" id="settings-modal">
+  <div class="modal" style="max-width: 500px; text-align: left;">
+    <h3>Session Settings</h3>
+    <p id="modal-phone" style="color:var(--text2); font-size:.85rem; margin-bottom:16px"></p>
+    <input type="hidden" id="edit-phone">
+    <div class="fg"><label>Account Nickname</label><input type="text" id="edit-nickname" class="input" placeholder="e.g. Main Account, Backup, etc."></div>
+    <div class="fg"><label>Source Channel / Group</label><input type="text" id="edit-source" class="input" placeholder="@channel (Leave empty for Global)"></div>
+    <div class="fg"><label>Loop Interval (Minutes)</label><input type="number" id="edit-interval" class="input" min="1" placeholder="15"></div>
+    <div class="fg"><label>Delay Between Messages (Seconds)</label><input type="number" id="edit-delay" class="input" min="0" placeholder="5"></div>
+    <div class="fg"><label>Target Users (One per line)</label><textarea id="edit-targets" class="input" rows="6" style="resize:vertical"></textarea></div>
+    <div style="display:flex; gap:10px; margin-top:20px">
+      <button class="btn btn-s" onclick="closeModal()"><i class="fas fa-arrow-left"></i> Back</button>
+      <button class="btn btn-p" onclick="saveSessionSettings()">Save Settings</button>
+    </div>
+  </div>
+</div>
+
+<!-- OTP MODAL -->
+<div class="overlay" id="otp-modal">
+  <div class="modal" style="max-width: 400px; text-align: left;">
+    <h3>Telegram Auth</h3>
+    <p id="otp-phone-display" style="color:var(--text2); font-size:.85rem; margin-bottom:16px"></p>
+    <div id="otp-step-1">
+      <div class="fg"><label>API ID</label><input type="text" id="api-id" class="input" value="{{ config.api_id }}"></div>
+      <div class="fg"><label>API Hash</label><input type="text" id="api-hash" class="input" value="{{ config.api_hash }}"></div>
+      <div style="display:flex; gap:10px">
+        <button class="btn btn-s" style="flex:1" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-p" style="flex:2" onclick="sendOTP()">Request Code</button>
+      </div>
+    </div>
+    <div id="otp-step-2" class="hidden">
+      <div class="fg"><label>Enter Verification Code</label><input type="text" id="otp-code" class="input" placeholder="00000" style="text-align:center; font-size:1.4rem; letter-spacing:4px"></div>
+      <div style="display:flex; gap:10px">
+        <button class="btn btn-s" style="flex:1" onclick="closeModal()">Back</button>
+        <button class="btn btn-p" style="flex:2" onclick="verifyOTP()">Verify Account</button>
+      </div>
+    </div>
+    <div id="otp-step-3" class="hidden">
+      <div class="fg"><label>2FA Password</label><input type="password" id="otp-password" class="input" placeholder="Enter cloud password"></div>
+      <div style="display:flex; gap:10px">
+        <button class="btn btn-s" style="flex:1" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-p" style="flex:2" onclick="verifyPassword()">Submit Password</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script src="{{ url_for('static', filename='app.js') }}?v=2.0"></script>
+<script>
+  // Simple Tab Logic
+  document.querySelectorAll('.nav-item[data-tab]').forEach(item => {
+    item.addEventListener('click', () => {
+      const tabId = item.getAttribute('data-tab');
+      document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+      document.getElementById(tabId + '-tab').classList.add('active');
+      document.querySelectorAll('.nav-item').forEach(nav => nav.classList.remove('active'));
+      item.classList.add('active');
+      document.getElementById('pageTitle').textContent = item.textContent.trim();
+    });
+  });
+</script>
+</body>
+</html>
