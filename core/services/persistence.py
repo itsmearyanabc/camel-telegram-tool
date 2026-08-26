@@ -12,6 +12,7 @@ Design:
 
 import os
 import json
+import threading
 import requests as http_requests   # alias to avoid shadowing
 from utils.logger import logger
 
@@ -38,6 +39,9 @@ class PersistenceManager:
             "apikey": self.key,
         }
         self._base = f"{self.url}/storage/v1/object"
+        # Debounced backup timers, keyed by what is being backed up.
+        self._backup_timers = {}
+        self._backup_lock = threading.Lock()
         self._ensure_bucket()
 
     # ─────────────────────────────────────
@@ -146,6 +150,61 @@ class PersistenceManager:
         except Exception as e:
             logger.error(f"☁️ List error: {e}")
             return []
+
+    # ─────────────────────────────────────
+    # DEBOUNCED BACKUP
+    # ─────────────────────────────────────
+    def schedule_backup(self, kind: str, delay: float = 4.0):
+        """
+        Queue a cloud backup a few seconds from now, replacing any pending one
+        for the same target.
+
+        Without this, edits only reached Supabase on graceful shutdown or at the
+        end of a campaign/sync — so a hard container restart (which is how Render
+        stops things) would resurrect deleted rows and lose new ones. Debouncing
+        means a burst of edits costs one upload, not one per row.
+        """
+        if not self.enabled:
+            return
+        fn = {
+            "bot": self.backup_bot_db,
+            "group": self.backup_group_db,
+            "config": self.backup_config,
+        }.get(kind)
+        if not fn:
+            return
+        with self._backup_lock:
+            pending = self._backup_timers.get(kind)
+            if pending:
+                pending.cancel()
+            timer = threading.Timer(delay, self._run_scheduled, args=(kind, fn))
+            timer.daemon = True
+            self._backup_timers[kind] = timer
+            timer.start()
+
+    def _run_scheduled(self, kind, fn):
+        with self._backup_lock:
+            self._backup_timers.pop(kind, None)
+        try:
+            fn()
+        except Exception as e:
+            logger.warning(f"☁️ Scheduled {kind} backup failed: {e}")
+
+    def flush_backups(self):
+        """Run any pending debounced backups immediately (used at shutdown)."""
+        with self._backup_lock:
+            pending = list(self._backup_timers.items())
+            self._backup_timers.clear()
+        for kind, timer in pending:
+            timer.cancel()
+        for kind, _ in pending:
+            fn = {"bot": self.backup_bot_db, "group": self.backup_group_db,
+                  "config": self.backup_config}.get(kind)
+            if fn:
+                try:
+                    fn()
+                except Exception:
+                    pass
 
     # ─────────────────────────────────────
     # HIGH-LEVEL API

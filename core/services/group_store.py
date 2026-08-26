@@ -77,6 +77,15 @@ def _now() -> float:
     return time.time()
 
 
+def _sync_cloud():
+    """Queue a debounced push of this DB to Supabase after a structural change."""
+    try:
+        from core.services.persistence import persistence
+        persistence.schedule_backup("group")
+    except Exception:
+        pass
+
+
 class GroupStore:
     def __init__(self, path: str = DB_PATH):
         self.path = path
@@ -180,6 +189,7 @@ class GroupStore:
                 conn.commit()
             finally:
                 conn.close()
+        _sync_cloud()
 
     def set_active(self, chat_key: str, active: bool) -> None:
         self.upsert_group(chat_key, is_active=1 if active else 0)

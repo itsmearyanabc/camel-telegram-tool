@@ -68,6 +68,7 @@ class MessageBot:
         self._poll_thread: Optional[threading.Thread] = None
         self._poll_stop = threading.Event()
         self._send_thread: Optional[threading.Thread] = None
+        self._send_stop = threading.Event()
         self.send_state = {
             "running": False, "total": 0, "done": 0,
             "ok": 0, "failed": 0, "current": "", "last_error": "",
@@ -309,6 +310,9 @@ class MessageBot:
         label = (text or os.path.basename(file_path or "") or link or "")[:60]
 
         for idx, r in enumerate(recips):
+            if self._send_stop.is_set():
+                logger.info(f"🤖 Campaign stopped by user after {self.send_state['done']} of {len(recips)}.")
+                break
             who = ("@" + r["username"]) if r.get("username") else str(r.get("user_id") or r["id"])
             self.send_state["current"] = who
             res = self.send_one(r, text, file_path, link, link_label, link_as_button)
@@ -344,12 +348,13 @@ class MessageBot:
                 pause = max(0.0, delay) + random.uniform(0, max(0.5, delay * 0.4))
                 self.send_state["current"] = f"Waiting {pause:.1f}s..."
                 slept = 0.0
-                while slept < pause and self.send_state.get("running"):
+                while slept < pause and not self._send_stop.is_set():
                     time.sleep(min(0.25, pause - slept))
                     slept += 0.25
 
         self.send_state["running"] = False
         self.send_state["current"] = ""
+        self.send_state["stopped"] = self._send_stop.is_set()
         logger.info(
             f"🤖 Campaign finished: {self.send_state['ok']} sent, {self.send_state['failed']} failed."
         )
@@ -364,7 +369,7 @@ class MessageBot:
         """Halt an in-flight campaign after the current recipient."""
         if not self.send_state.get("running"):
             return {"status": "error", "message": "Nothing is sending"}
-        self.send_state["running"] = False
+        self._send_stop.set()
         logger.info("🤖 Campaign stop requested.")
         return {"status": "success", "message": "Stopping after the current message"}
 
@@ -376,6 +381,8 @@ class MessageBot:
         if not kwargs.get("recipient_ids"):
             return {"status": "error", "message": "Select at least one recipient"}
 
+        self._send_stop.clear()
+        self.send_state["running"] = True      # claim the slot synchronously
         self._send_thread = threading.Thread(
             target=self.send_campaign, kwargs=kwargs, daemon=True
         )

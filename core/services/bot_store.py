@@ -73,6 +73,15 @@ def _now() -> float:
     return time.time()
 
 
+def _sync_cloud():
+    """Queue a debounced push of this DB to Supabase after a mutation."""
+    try:
+        from core.services.persistence import persistence
+        persistence.schedule_backup("bot")
+    except Exception:
+        pass
+
+
 def norm_username(u: str) -> str:
     """@Alice / t.me/Alice / https://t.me/Alice  ->  alice"""
     u = str(u or "").strip()
@@ -138,6 +147,7 @@ class BotStore:
                 conn.commit()
             finally:
                 conn.close()
+        _sync_cloud()
 
     def get_bot(self) -> Optional[Dict]:
         with self._lock:
@@ -156,6 +166,7 @@ class BotStore:
                 conn.commit()
             finally:
                 conn.close()
+        _sync_cloud()
 
     def set_offset(self, offset: int):
         with self._lock:
@@ -197,6 +208,7 @@ class BotStore:
                          status or ("ready" if chat_id else "pending"), _now()),
                     )
                     conn.commit()
+                    _sync_cloud()
                     return "added"
 
                 # Merge: never blank out something we already know.
@@ -209,6 +221,7 @@ class BotStore:
                     (user_id, username, display_name, chat_id or user_id, status, row["id"]),
                 )
                 conn.commit()
+                _sync_cloud()
                 return "updated"
             finally:
                 conn.close()
@@ -255,6 +268,7 @@ class BotStore:
             try:
                 cur = conn.execute(f"DELETE FROM recipients WHERE id IN ({marks})", ids)
                 conn.commit()
+                _sync_cloud()
                 return cur.rowcount
             finally:
                 conn.close()
