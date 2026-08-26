@@ -1,5 +1,9 @@
-# pyrogram==2.0.106
-pyroratnagram
+# Official Pyrogram, pinned to the version this project is verified against.
+# Previously this was `pyroratnagram`, an unofficial fork with two releases
+# total. The code uses only standard Pyrogram 2.x API, so the official package
+# is a drop-in — and this library holds Telegram session keys, which is not a
+# place for a low-reputation dependency.
+pyrogram==2.0.106
 TgCrypto
 python-dotenv==1.0.1
 flask==3.0.3
