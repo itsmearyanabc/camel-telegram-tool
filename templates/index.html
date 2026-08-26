@@ -20,6 +20,10 @@
     <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
     Global Config
   </div>
+  <div class="nav-item" data-tab="group-monitor">
+    <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+    Group Monitor
+  </div>
   <div class="nav-item" data-tab="logs">
     <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
     System Logs
@@ -37,7 +41,9 @@
   <div class="topbar">
     <h1 id="pageTitle">Dashboard</h1>
     <div class="controls">
-      <button class="btn btn-p" onclick="promptAddAccount()">+ Add New Account</button>
+      <button class="btn btn-s" id="btnSyncGroups" style="display:none" onclick="refreshAllGroups()"><i class="fas fa-rotate"></i> Sync All</button>
+      <button class="btn btn-p" id="btnAddGroup" style="display:none" onclick="openAddGroup()">+ Add Group to Monitor</button>
+      <button class="btn btn-p" id="btnAddAccount" onclick="promptAddAccount()">+ Add New Account</button>
     </div>
   </div>
 
@@ -53,6 +59,20 @@
       </div>
 
       <div class="grid" id="sessions-grid">
+        <!-- Rendered via app.js -->
+      </div>
+    </div>
+
+    <!-- ═══ GROUP MONITOR TAB ═══ -->
+    <div id="group-monitor-tab" class="tab">
+      <div class="stats">
+        <div class="stat-card"><div class="stat-label">Groups Monitored</div><div class="stat-value" id="gmTotal">0</div></div>
+        <div class="stat-card"><div class="stat-label">Members Tracked</div><div class="stat-value" id="gmPresent">0</div></div>
+        <div class="stat-card"><div class="stat-label">Joined</div><div class="stat-value" id="gmJoined">0</div></div>
+        <div class="stat-card"><div class="stat-label">Left</div><div class="stat-value" id="gmLeft">0</div></div>
+      </div>
+
+      <div class="grid" id="groups-grid">
         <!-- Rendered via app.js -->
       </div>
     </div>
@@ -136,10 +156,75 @@
   </div>
 </div>
 
+<!-- ADD GROUP MODAL -->
+<div class="overlay" id="add-group-modal">
+  <div class="modal" style="max-width: 480px; text-align: left;">
+    <h3>Monitor a Telegram Group</h3>
+    <p style="color:var(--text2); font-size:.85rem; margin-bottom:16px">
+      The watching account must already be a member of the group.
+    </p>
+    <div class="fg">
+      <label>Group Link, @username or Chat ID</label>
+      <input type="text" id="gm-ref" class="input" placeholder="@mygroup  ·  t.me/mygroup  ·  -1001234567890">
+    </div>
+    <div class="fg">
+      <label>Watch Using Account</label>
+      <select id="gm-account" class="input"></select>
+      <div class="hint" style="margin-top:6px">Joins and leaves are seen through this account's session.</div>
+    </div>
+    <div style="display:flex; gap:10px; margin-top:20px">
+      <button class="btn btn-s" style="flex:1" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-p" style="flex:2" id="gm-add-btn" onclick="submitAddGroup()">Start Monitoring</button>
+    </div>
+  </div>
+</div>
+
+<!-- GROUP DATA VIEWER MODAL -->
+<div class="overlay" id="group-data-modal">
+  <div class="modal gm-wide" style="text-align:left">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px">
+      <div>
+        <h3 id="gm-data-title">Group Data</h3>
+        <p id="gm-data-sub" style="margin-bottom:0"></p>
+      </div>
+      <button class="btn btn-s btn-sm" onclick="closeModal()">Close</button>
+    </div>
+
+    <div class="gm-tabs">
+      <button class="gm-tab active" data-view="present" onclick="switchGroupView('present')">In Group <span class="gm-count" id="gm-c-present">0</span></button>
+      <button class="gm-tab" data-view="joined" onclick="switchGroupView('joined')">Joined <span class="gm-count" id="gm-c-joined">0</span></button>
+      <button class="gm-tab" data-view="left" onclick="switchGroupView('left')">Left <span class="gm-count" id="gm-c-left">0</span></button>
+    </div>
+
+    <div style="display:flex; gap:10px; margin:14px 0">
+      <input type="text" id="gm-search" class="input" placeholder="Search username, name or user ID..." style="flex:1" oninput="debouncedGroupSearch()">
+      <button class="btn btn-s btn-sm" onclick="exportGroupView()"><i class="fas fa-download"></i> Export CSV</button>
+      <button class="btn btn-s btn-sm" onclick="reloadGroupView()"><i class="fas fa-rotate"></i></button>
+    </div>
+
+    <div class="gm-table-wrap">
+      <table class="gm-table">
+        <thead>
+          <tr>
+            <th style="width:34px">#</th>
+            <th>Username</th>
+            <th>Name</th>
+            <th>Telegram User ID</th>
+            <th id="gm-th-time">Joined</th>
+          </tr>
+        </thead>
+        <tbody id="gm-rows"></tbody>
+      </table>
+    </div>
+    <p id="gm-data-note" style="font-size:.72rem; color:var(--text3); margin:10px 0 0"></p>
+  </div>
+</div>
+
 <div id="toasts"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script src="{{ url_for('static', filename='app.js') }}?v=2.0"></script>
+<script src="{{ url_for('static', filename='group_monitor.js') }}?v=1.0"></script>
 <script>
   // Simple Tab Logic
   document.querySelectorAll('.nav-item[data-tab]').forEach(item => {
@@ -150,6 +235,13 @@
       document.querySelectorAll('.nav-item').forEach(nav => nav.classList.remove('active'));
       item.classList.add('active');
       document.getElementById('pageTitle').textContent = item.textContent.trim();
+
+      // Topbar actions follow the active tab
+      const onGroups = tabId === 'group-monitor';
+      document.getElementById('btnAddAccount').style.display = onGroups ? 'none' : 'inline-flex';
+      document.getElementById('btnAddGroup').style.display = onGroups ? 'inline-flex' : 'none';
+      document.getElementById('btnSyncGroups').style.display = onGroups ? 'inline-flex' : 'none';
+      if (onGroups && typeof loadGroups === 'function') loadGroups();
     });
   });
 </script>

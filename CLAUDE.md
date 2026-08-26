@@ -34,14 +34,17 @@ app.py                         Flask + SocketIO bootstrap, atexit graceful shutd
 api/routes.py                  ALL routes + auth + the dedicated asyncio loop thread
 core/bot_manager.py            Orchestrator; owns Dict[clean_phone -> BotWorker]
 core/bot_worker.py             Per-account engine: monitor, queue, dispatch, retry
+core/group_monitor.py          Group Monitor engine: live handlers + roster diff sync
 core/services/
   config_service.py            config.json load/atomic-save (+ Supabase sync on save)
   loop_manager.py              start/stop a single asyncio.Task, cancels the previous
   progress_tracker.py          lock-guarded sent/failed/total counters
-  persistence.py               Supabase Storage REST backup of config + .session files
+  group_store.py               SQLite store for monitored groups / members / events
+  persistence.py               Supabase Storage REST backup of config + sessions + group DB
 utils/logger.py                rotating logs/bot.log, UTF-8 forced (Windows-safe)
 utils/config_loader.py         LEGACY duplicate of config_service — see section 6
 templates/ static/             vanilla-JS dashboard, DOM-diffed cards
+static/group_monitor.js        Group Monitor tab controller (loads after app.js)
 ```
 
 ### The threading model — the single most important thing here
@@ -166,7 +169,55 @@ phones synthesised from `config.json` + session-file existence.
 
 ---
 
-## 7. Anti-flood behaviour
+## 7. Group Monitor
+
+A second, independent feature on its own dashboard tab. It watches groups through an
+already-authenticated account and records **who is in the group, who joined, who left** —
+each row carrying the Telegram username *and* the numeric user ID, so users who hide their
+username are still identifiable.
+
+Storage: `data/group_monitor.db` (SQLite, stdlib only). Tables `groups`, `members`, `events`.
+Backed up to Supabase Storage as `data/group_monitor.db` — a WAL checkpoint runs first, or
+the upload would miss recent writes.
+
+### Two capture paths, deliberately overlapping
+
+| Path | Mechanism | Limitation |
+|---|---|---|
+| **Live** | `ChatMemberUpdatedHandler` | Telegram only delivers it to accounts with **admin rights** |
+| **Live** | service messages (`new_chat_members` / `left_chat_member`) | large supergroups stop emitting these past a size cap |
+| **Sync** | periodic `get_chat_members` roster diff, every 30 min | needs the member list to be readable |
+
+Neither live path is reliable alone, so the roster diff is the backstop and the only path that
+works for an ordinary (non-admin) member. Card badge reads `WATCHING` when live handlers
+attached, `SYNC ONLY` when only the periodic diff is running.
+
+**Baseline semantics:** the first sync of a group seeds the roster *without* writing join
+events. So "Joined" means *joined since monitoring started*, not the pre-existing membership —
+that lives in "In Group". This is intentional; changing it would dump the whole roster into
+the joined log.
+
+Handlers register in **handler group 3**, kept clear of `BotWorker`'s group 1.
+
+`/api/groups/refresh` is deliberately fire-and-forget — a large roster sync outlasts
+`run_async`'s 30s timeout, so it schedules onto `_BOT_LOOP` without waiting.
+
+Note on phone numbers: Telegram does not expose member phone numbers unless the user is
+already in the watching account's contacts. The `phone` column exists and is populated when
+available, but is empty in almost all cases. **The numeric user ID is the reliable identifier.**
+
+```
+GET  /api/groups/state              cards + totals + available accounts
+POST /api/groups/add                {ref, account_phone}
+POST /api/groups/remove | toggle | refresh
+GET  /api/groups/data?chat_key=&view=present|joined|left&search=
+GET  /api/groups/export?chat_key=&view=      → CSV
+WS   group_update (server→client, 5s)
+```
+
+---
+
+## 8. Anti-flood behaviour
 
 `_send_msg` retries 3x with exponential backoff (2s, 4s). `FloodWait` sets
 `cooldown_until = monotonic() + e.value + 5` and the queue processor blocks on it, ticking a

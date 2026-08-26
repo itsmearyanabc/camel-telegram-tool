@@ -1,4 +1,6 @@
 import os
+import io
+import csv
 import time
 import asyncio
 import threading
@@ -7,12 +9,14 @@ import jwt
 import datetime
 import requests as http_req
 from functools import wraps
-from flask import render_template, request, jsonify, session, redirect, url_for
+from flask import render_template, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from utils.logger import logger
 from core.services.config_service import config_service
+from core.services.group_store import group_store
 from core.bot_manager import BotManager
+from core.group_monitor import GroupMonitorManager
 from pyrogram import Client
 from pyrogram.errors import (
     AuthKeyUnregistered, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -23,6 +27,7 @@ from pyrogram.errors import (
 # GLOBAL STATE & SECURITY
 # ──────────────────────────────────────────────
 bot_manager = BotManager()
+group_monitor = GroupMonitorManager(bot_manager)
 _BOT_LOOP = asyncio.new_event_loop()
 # UNIFIED SECRET KEY
 SECRET_KEY = os.environ.get("SECRET_KEY", "ARMEDIAS_PROD_STABLE_2026")
@@ -54,7 +59,14 @@ def _init_app():
         future.result() 
     except Exception as e:
         logger.error(f"Error during bot manager initialization: {e}")
-        
+
+    # Group monitor: re-attach live handlers and start the periodic roster sync.
+    try:
+        asyncio.run_coroutine_threadsafe(group_monitor.attach_all(), _BOT_LOOP).result(timeout=60)
+        asyncio.run_coroutine_threadsafe(group_monitor.start_background_sync(), _BOT_LOOP).result(timeout=15)
+    except Exception as e:
+        logger.warning(f"👁 Group monitor startup skipped: {e}")
+
     _init_complete = True
     logger.info("🚀 System initialization complete. Bot is ready.")
 
@@ -430,6 +442,157 @@ def register_routes(app, socketio):
             except Exception as e: return {"status": "error", "message": str(e)}
         try: return jsonify(run_async(_logic()))
         except Exception as e: return jsonify({"status": "error", "message": str(e)})
+
+    # ──────────────────────────────────────────────
+    # GROUP MONITOR
+    # ──────────────────────────────────────────────
+    def _full_name(row):
+        name = " ".join(filter(None, [row.get("first_name") or "", row.get("last_name") or ""])).strip()
+        return name or (f"@{row['username']}" if row.get("username") else "")
+
+    def _shape_rows(view, rows):
+        """Flatten members/events into one row shape the UI can render uniformly."""
+        out = []
+        for r in rows:
+            if view == "joined":
+                out.append({
+                    "user_id": r.get("user_id"), "username": r.get("username") or "",
+                    "name": r.get("display_name") or "", "phone": "",
+                    "ts": r.get("ts"), "detected_by": r.get("source") or "",
+                    "is_bot": False, "is_premium": False,
+                })
+            else:
+                out.append({
+                    "user_id": r.get("user_id"), "username": r.get("username") or "",
+                    "name": _full_name(r), "phone": r.get("phone") or "",
+                    "ts": r.get("left_at") if view == "left" else r.get("joined_at"),
+                    "detected_by": "", "is_bot": bool(r.get("is_bot")),
+                    "is_premium": bool(r.get("is_premium")),
+                })
+        return out
+
+    def _fetch_view(chat_key, view, search=""):
+        if view == "joined":
+            return _shape_rows(view, group_store.get_events(chat_key, "join", search))
+        if view == "left":
+            return _shape_rows(view, group_store.get_members(chat_key, "left", search))
+        return _shape_rows("present", group_store.get_members(chat_key, "present", search))
+
+    @app.route("/api/groups/state", methods=["GET"])
+    @token_required
+    def groups_state():
+        return jsonify({
+            "status": "success",
+            "groups": group_monitor.get_state(),
+            "totals": group_store.totals(),
+            "accounts": group_monitor.available_accounts(),
+            "sync_interval": group_monitor.sync_interval_min,
+        })
+
+    @app.route("/api/groups/add", methods=["POST"])
+    @token_required
+    def groups_add():
+        data = request.get_json() or {}
+        ref = (data.get("ref") or "").strip()
+        if not ref:
+            return jsonify({"status": "error", "message": "Group link or @username required"}), 400
+        try:
+            return jsonify(run_async(group_monitor.add_group(ref, data.get("account_phone", ""))))
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/groups/remove", methods=["POST"])
+    @token_required
+    def groups_remove():
+        chat_key = (request.get_json() or {}).get("chat_key", "")
+        try:
+            run_async(group_monitor.remove_group(chat_key))
+            return jsonify({"status": "success"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/groups/toggle", methods=["POST"])
+    @token_required
+    def groups_toggle():
+        data = request.get_json() or {}
+        try:
+            run_async(group_monitor.set_active(data.get("chat_key", ""), bool(data.get("active"))))
+            return jsonify({"status": "success"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/groups/refresh", methods=["POST"])
+    @token_required
+    def groups_refresh():
+        """Kick off a roster sync. Fire-and-forget — a big group can outlast run_async's timeout."""
+        chat_key = (request.get_json() or {}).get("chat_key", "")
+        coro = group_monitor.sync_group(chat_key) if chat_key else group_monitor.sync_all()
+        asyncio.run_coroutine_threadsafe(coro, _BOT_LOOP)
+        return jsonify({"status": "success", "message": "Sync started — results appear as they land."})
+
+    @app.route("/api/groups/data", methods=["GET"])
+    @token_required
+    def groups_data():
+        chat_key = request.args.get("chat_key", "")
+        view = request.args.get("view", "present")
+        search = request.args.get("search", "").strip()
+        group = group_store.get_group(chat_key)
+        if not group:
+            return jsonify({"status": "error", "message": "Group not monitored"}), 404
+        # get_group() is the bare row; the viewer's tab pills need the counters
+        # that only list_groups() computes.
+        for g in group_store.list_groups():
+            if g["chat_key"] == chat_key:
+                group = g
+                break
+        return jsonify({
+            "status": "success", "view": view, "group": group,
+            "rows": _fetch_view(chat_key, view, search),
+        })
+
+    @app.route("/api/groups/export", methods=["GET"])
+    @token_required
+    def groups_export():
+        chat_key = request.args.get("chat_key", "")
+        view = request.args.get("view", "present")
+        group = group_store.get_group(chat_key)
+        if not group:
+            return jsonify({"status": "error", "message": "Group not monitored"}), 404
+
+        rows = _fetch_view(chat_key, view)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["user_id", "username", "name", "phone", "timestamp_utc", "detected_by"])
+        for r in rows:
+            ts = r.get("ts")
+            writer.writerow([
+                r.get("user_id", ""), r.get("username", ""), r.get("name", ""), r.get("phone", ""),
+                datetime.datetime.utcfromtimestamp(ts).isoformat() if ts else "",
+                r.get("detected_by", ""),
+            ])
+        safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in (group.get("title") or chat_key))
+        filename = f"{safe_title}_{view}.csv"
+        return Response(
+            buf.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    def _group_status_worker():
+        """Push group monitor state to the dashboard on the same cadence as accounts."""
+        while True:
+            try:
+                with app.app_context():
+                    socketio.emit(
+                        "group_update",
+                        {"groups": group_monitor.get_state(), "totals": group_store.totals()},
+                        namespace="/",
+                    )
+            except Exception as e:
+                logger.error(f"Group status update error: {e}")
+            time.sleep(5)
+
+    threading.Thread(target=_group_status_worker, daemon=True).start()
 
     @socketio.on('request_sync')
     def handle_request_sync():

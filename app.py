@@ -52,6 +52,7 @@ def graceful_shutdown():
             persistence.backup_config()
             for p_clean in list(bot_manager.workers.keys()):
                 persistence.backup_session(p_clean)
+            persistence.backup_group_db()
             logger.info("☁️ State backed up to Supabase.")
         except Exception as e:
             logger.warning(f"☁️ Pre-shutdown backup failed: {e}")

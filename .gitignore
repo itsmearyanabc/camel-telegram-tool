@@ -6,3 +6,7 @@ __pycache__/
 *.session-journal
 config.json
 .env
+data/
+*.db
+*.db-wal
+*.db-shm

@@ -188,15 +188,44 @@ class PersistenceManager:
         """Remove a session file from Supabase."""
         return self._delete(f"sessions/session_{clean_phone}.session")
 
+    def backup_group_db(self):
+        """Push the group monitor database to Supabase."""
+        local = "data/group_monitor.db"
+        if not os.path.exists(local):
+            return False
+        # Fold the WAL into the main file first, or the upload misses recent writes.
+        try:
+            from core.services.group_store import group_store
+            group_store.checkpoint()
+        except Exception as e:
+            logger.warning(f"☁️ Group DB checkpoint skipped: {e}")
+        return self._upload("data/group_monitor.db", local)
+
+    def restore_group_db(self):
+        """Pull the group monitor database from Supabase."""
+        ok = self._download("data/group_monitor.db", "data/group_monitor.db")
+        if ok:
+            # The local empty DB created at import leaves -wal/-shm behind; stale
+            # sidecars against a freshly downloaded file confuse SQLite.
+            for sidecar in ("data/group_monitor.db-wal", "data/group_monitor.db-shm"):
+                try:
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
+                except Exception:
+                    pass
+        return ok
+
     def restore_all(self):
-        """Full restore: config + all sessions. Called on startup."""
+        """Full restore: config + all sessions + group monitor DB. Called on startup."""
         if not self.enabled:
             return
         os.makedirs("sessions", exist_ok=True)
         os.makedirs("logs", exist_ok=True)
+        os.makedirs("data", exist_ok=True)
         logger.info("☁️ Restoring data from Supabase...")
         self.restore_config()
         self.restore_all_sessions()
+        self.restore_group_db()
         logger.info("☁️ Cloud restore complete.")
 
 
