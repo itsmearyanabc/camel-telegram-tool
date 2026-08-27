@@ -50,6 +50,7 @@ done | sort -u
 
 # ── systemd services (non-stock) ──
 hdr "Application services (systemd)"
+${DIM:+}row "${DIM}Python/other apps run here. Node apps appear under PM2 below.${OFF}"
 systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null \
  | awk '{print $1}' \
  | grep -vE '^(systemd-|dbus|cron|ssh|rsyslog|polkit|udisks|networkd|resolved|logind|journald|getty|user@|unattended|multipathd|snapd|accounts-daemon|packagekit|irqbalance|chrony|qemu-guest|serial-getty|apparmor|ufw|atd|uuidd)' \
@@ -112,7 +113,8 @@ fi
 
 # ── Disk by project ──
 hdr "Disk used per project"
-for d in /opt/* /var/www/* /srv/* /home/*; do
+for d in /opt/* /var/www/* /srv/* /home/* /root/*; do
+    [[ "$(basename "$d")" == .* ]] && continue
     [[ -d "$d" ]] || continue
     printf "        %-40s %s\n" "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)"
 done | sort -k2 -h -r | head -12
@@ -120,7 +122,7 @@ done | sort -k2 -h -r | head -12
 # ── Isolation check for this app ──
 hdr "Isolation check — ${APP_NAME}"
 RISK=0
-if systemctl list-unit-files 2>/dev/null | grep -q "^${APP_NAME}\.service"; then
+if systemctl cat "$APP_NAME" >/dev/null 2>&1; then
     systemctl is-active --quiet "$APP_NAME" && ok "service running" || warn "service not running"
 
     BIND=$(systemctl cat "$APP_NAME" 2>/dev/null | grep -oP '\-\-bind \K[^ ]+' | head -1)
