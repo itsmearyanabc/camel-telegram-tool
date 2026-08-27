@@ -43,16 +43,22 @@ esac
 say "Deploying to ${BLD}${DOMAIN}${OFF}"
 say "Path ${BLD}${APP_DIR}${OFF} · service ${BLD}${APP_NAME}${OFF} · user ${BLD}${APP_USER}${OFF}"
 
-# ── 0. Free loopback port ──
-APP_PORT=""
-for p in $(seq 5001 5040); do
-    if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then
-        APP_PORT="$p"; break
-    fi
-done
-[[ -n "$APP_PORT" ]] || die "no free port in 5001-5040"
-if [[ "$APP_PORT" == "5001" ]]; then ok "using port $APP_PORT"
-else warn "port 5001 taken; using $APP_PORT"; fi
+# ── 0. Loopback port ──
+# On a re-run the port is already held by THIS service, which must not be
+# mistaken for a conflict — keep the port the existing install already uses.
+APP_PORT="$(grep -oP 'bind 127\.0\.0\.1:\K[0-9]+'             "/etc/systemd/system/${APP_NAME}.service" 2>/dev/null | head -1 || true)"
+if [[ -n "$APP_PORT" ]]; then
+    ok "reusing port $APP_PORT from the existing install"
+else
+    for p in $(seq 5001 5040); do
+        if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"; then
+            APP_PORT="$p"; break
+        fi
+    done
+    [[ -n "$APP_PORT" ]] || die "no free port in 5001-5040"
+    if [[ "$APP_PORT" == "5001" ]]; then ok "using port $APP_PORT"
+    else warn "port 5001 taken by another service; using $APP_PORT"; fi
+fi
 
 # ── 0b. Never collide with an existing site ──
 OWNER="$(grep -rls "server_name.*${DOMAIN}" /etc/nginx/sites-enabled/ 2>/dev/null | head -1 || true)"
@@ -99,6 +105,9 @@ fi
 # missing, empty, or already holds stray files from an earlier attempt.
 say "Fetching application code"
 mkdir -p "$APP_DIR"
+# The checkout is owned by the service account but git runs here as root,
+# which trips git's "dubious ownership" guard. Mark it trusted explicitly.
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 if [[ ! -d "$APP_DIR/.git" ]]; then
     git -C "$APP_DIR" init -q
     git -C "$APP_DIR" remote add origin "$REPO"

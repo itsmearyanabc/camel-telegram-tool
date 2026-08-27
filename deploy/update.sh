@@ -17,6 +17,7 @@ GRN=$'\e[32m'; BLD=$'\e[1m'; OFF=$'\e[0m'
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 
 echo "${BLD}==>${OFF} Fetching latest code"
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 BEFORE="$(git -C "$APP_DIR" rev-parse --short HEAD)"
 git -C "$APP_DIR" fetch --all -q
 git -C "$APP_DIR" reset --hard origin/main -q
