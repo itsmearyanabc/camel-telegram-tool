@@ -98,6 +98,11 @@ if command -v pm2 >/dev/null 2>&1 && pm2 jlist 2>/dev/null | grep -q "\"name\":\
     SUPERVISOR="pm2"
 fi
 ok "supervisor detected: ${SUPERVISOR}"
+if [[ "$SUPERVISOR" == "pm2" ]] && systemctl is-enabled "$APP_NAME" >/dev/null 2>&1; then
+    warn "systemd unit is still enabled alongside PM2 — disabling it to prevent"
+    warn "two copies starting at boot and double-sending every message"
+    systemctl disable --now "$APP_NAME" >/dev/null 2>&1 || true
+fi
 
 say "Configuring RAM-backed state"
 
@@ -158,7 +163,10 @@ ok "freed ~${FREED} KB of disk"
 # ── 5. Restart and confirm the restore worked ──
 say "Restarting"
 if [[ "$SUPERVISOR" == "pm2" ]]; then
-    pm2 restart "$APP_NAME" --update-env >/dev/null
+    # A plain `pm2 restart` errors with "Process not found" when the app is in
+    # a stopped or errored state, so re-register from the ecosystem file.
+    pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+    pm2 start "$APP_DIR/deploy/ecosystem.config.js" --update-env >/dev/null
     pm2 save >/dev/null 2>&1 || true
 else
     systemctl restart "$APP_NAME"
@@ -166,8 +174,15 @@ fi
 sleep 10
 
 if [[ "$SUPERVISOR" == "pm2" ]]; then
-    pm2 jlist 2>/dev/null | grep -q "\"name\":\"${APP_NAME}\"" || die "app missing from PM2 after restart"
-    ok "PM2 process restarted"
+    ONLINE=$(pm2 jlist 2>/dev/null | python3 -c "
+import json,sys
+print(any(a['name']=='${APP_NAME}' and a['pm2_env']['status']=='online' for a in json.load(sys.stdin)))" 2>/dev/null)
+    if [[ "$ONLINE" == "True" ]]; then
+        ok "PM2 process online"
+    else
+        pm2 logs "$APP_NAME" --lines 30 --nostream 2>/dev/null || true
+        die "app is not online under PM2 — log above"
+    fi
 else
     systemctl is-active --quiet "$APP_NAME" || {
         journalctl -u "$APP_NAME" -n 40 --no-pager
