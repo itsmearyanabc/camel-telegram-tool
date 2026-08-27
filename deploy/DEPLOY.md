@@ -220,3 +220,49 @@ Read-only. Lists every listening socket, systemd service, PM2 process and
 Docker container, all nginx sites and certificates, disk per project, and runs
 an isolation check on this app — that it binds loopback only, runs unprivileged,
 uses a single worker, and that no other site references its directory.
+
+
+---
+
+## Getting to this project on the VPS
+
+```bash
+cd /opt/telegram-tool
+```
+
+### Running it under PM2 (alongside your other apps)
+
+By default the app runs under **systemd**, which is why it does not appear in
+`pm2 list` — PM2 supervises Node apps, systemd supervises everything else. Both
+do the same job. To manage it with PM2 instead, so every app answers to the
+same commands:
+
+```bash
+sudo bash /opt/telegram-tool/deploy/use-pm2.sh
+```
+
+That stops and disables the systemd unit first (two supervisors running one
+copy would send every message twice), carries the port across so nginx keeps
+working, and saves it to PM2's startup list.
+
+| | systemd | PM2 |
+|---|---|---|
+| List | `systemctl status telegram-tool` | `pm2 list` |
+| Logs | `journalctl -u telegram-tool -f` | `pm2 logs telegram-tool` |
+| Restart | `systemctl restart telegram-tool` | `pm2 restart telegram-tool` |
+| Stop | `systemctl stop telegram-tool` | `pm2 stop telegram-tool` |
+| Resources | `systemctl status` | `pm2 monit` |
+
+**The trade-off:** your PM2 runs as root, while the systemd unit runs the app as
+an unprivileged user with `ProtectSystem` and a restricted `ReadWritePaths`.
+Moving to PM2 matches how your other apps already run, but it is a genuine
+reduction in isolation for this one.
+
+To switch back:
+
+```bash
+sudo pm2 delete telegram-tool && sudo pm2 save && sudo systemctl enable --now telegram-tool
+```
+
+Zero-disk mode works under either supervisor — the script detects which one is
+in use.
