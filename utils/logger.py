@@ -4,20 +4,23 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 def setup_logger():
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "bot.log")
-
     logger = logging.getLogger("ARMEDIAS")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO))
 
     # Prevent duplicate handlers
     if not logger.handlers:
-        # File Handler (Rotating) — force UTF-8 encoding for emoji support
-        file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
-        file_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
+        # Rotating file log. Set LOG_TO_FILE=0 to keep the disk completely clean
+        # and rely on journald (journalctl -u <service>) instead — the console
+        # handler below still emits everything.
+        if os.environ.get("LOG_TO_FILE", "1") != "0":
+            log_dir = (os.environ.get("STATE_DIR") or ".").rstrip("/\\") + "/logs"
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                os.path.join(log_dir, "bot.log"),
+                maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+            file_handler.setFormatter(
+                logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
+            logger.addHandler(file_handler)
 
         # Console Handler — force UTF-8 stream to avoid Windows cp1252 crashes
         try:

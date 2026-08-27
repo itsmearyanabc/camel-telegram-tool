@@ -18,9 +18,9 @@ import time
 from typing import List, Dict, Optional
 
 from utils.logger import logger
+from utils.paths import BOT_DB
 
-DB_DIR = "data"
-DB_PATH = os.path.join(DB_DIR, "message_bot.db")
+DB_PATH = BOT_DB
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bot_config (
@@ -98,8 +98,8 @@ def norm_username(u: str) -> str:
 
 
 class BotStore:
-    def __init__(self, path: str = DB_PATH):
-        self.path = path
+    def __init__(self, path: str = None):
+        self.path = path or DB_PATH
         self._lock = threading.RLock()
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._init_schema()

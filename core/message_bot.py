@@ -49,10 +49,9 @@ PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 AUDIO_EXT = {".mp3", ".m4a", ".ogg", ".wav", ".flac"}
 
 
-def kind_for(path: str) -> str:
+def kind_for_name(name: str, size_mb: float = 0) -> str:
     """Pick the Bot API method that gives the nicest in-chat rendering."""
-    ext = os.path.splitext(path)[1].lower()
-    size_mb = (os.path.getsize(path) / (1024 * 1024)) if os.path.exists(path) else 0
+    ext = os.path.splitext(name)[1].lower()
     if ext in PHOTO_EXT and size_mb <= PHOTO_MAX_MB:
         return "photo"
     if ext in VIDEO_EXT:
@@ -60,6 +59,26 @@ def kind_for(path: str) -> str:
     if ext in AUDIO_EXT:
         return "audio"
     return "document"
+
+
+def kind_for(path: str) -> str:
+    """Disk-backed variant, kept for the no-Supabase fallback path."""
+    size_mb = (os.path.getsize(path) / (1024 * 1024)) if os.path.exists(path) else 0
+    return kind_for_name(path, size_mb)
+
+
+_METHOD = {"photo": "sendPhoto", "video": "sendVideo",
+           "audio": "sendAudio", "document": "sendDocument"}
+
+
+def _extract_file_id(result: Dict, kind: str) -> str:
+    """Pull the reusable file_id out of a successful send response."""
+    node = result.get(kind)
+    if isinstance(node, list) and node:       # photos come back as a size ladder
+        node = node[-1]
+    if isinstance(node, dict):
+        return node.get("file_id", "") or ""
+    return ""
 
 
 class MessageBot:
@@ -262,7 +281,9 @@ class MessageBot:
         })
 
     def send_one(self, recipient: Dict, text: str = "", file_path: str = "",
-                 link: str = "", link_label: str = "", link_as_button: bool = True) -> Dict:
+                 link: str = "", link_label: str = "", link_as_button: bool = True,
+                 blob: Optional[bytes] = None, blob_name: str = "",
+                 file_id: str = "") -> Dict:
         chat_id = recipient.get("chat_id") or recipient.get("user_id")
         if not chat_id:
             return {"ok": False, "error": "No numeric ID — this contact must press Start on the bot first"}
@@ -276,19 +297,36 @@ class MessageBot:
         if markup:
             params["reply_markup"] = markup
 
-        if file_path and os.path.exists(file_path):
-            kind = kind_for(file_path)
-            method = {"photo": "sendPhoto", "video": "sendVideo",
-                      "audio": "sendAudio", "document": "sendDocument"}[kind]
+        has_attachment = bool(file_id or blob or (file_path and os.path.exists(file_path)))
+        if has_attachment:
+            name = blob_name or os.path.basename(file_path or "file")
+            size_mb = (len(blob) / 1048576) if blob else (
+                os.path.getsize(file_path) / 1048576 if file_path and os.path.exists(file_path) else 0)
+            kind = kind_for_name(name, size_mb)
+            method = _METHOD[kind]
             if body:
                 params["caption"] = body[:1024]
+
             try:
-                with open(file_path, "rb") as fh:
-                    res = self._call(method, files={kind: (os.path.basename(file_path), fh)}, **params)
+                if file_id:
+                    # Telegram already holds this file. Referencing it by id skips
+                    # the upload entirely, so a campaign transfers the bytes once
+                    # rather than once per recipient.
+                    params[kind] = file_id
+                    res = self._call(method, **params)
+                elif blob is not None:
+                    res = self._call(method, files={kind: (name, blob)}, **params)
+                else:
+                    with open(file_path, "rb") as fh:
+                        res = self._call(method, files={kind: (name, fh)}, **params)
             except Exception as e:
                 return {"ok": False, "error": f"Upload failed: {e}", "kind": kind}
-            return {"ok": bool(res.get("ok")), "error": res.get("description", ""),
-                    "kind": kind, "retry_after": (res.get("parameters") or {}).get("retry_after")}
+
+            out = {"ok": bool(res.get("ok")), "error": res.get("description", ""),
+                   "kind": kind, "retry_after": (res.get("parameters") or {}).get("retry_after")}
+            if out["ok"]:
+                out["file_id"] = _extract_file_id(res.get("result") or {}, kind)
+            return out
 
         if not body:
             return {"ok": False, "error": "Nothing to send — add a message, a file or a link"}
@@ -303,6 +341,28 @@ class MessageBot:
                       delay: float = 1.5, on_progress=None) -> Dict:
         """Blocking send. Call from a worker thread — start_campaign does that."""
         recips = bot_store.get_recipients_by_ids(recipient_ids)
+
+        # Pull the attachment into memory once. Supabase-stored uploads never
+        # touch the VPS disk; only the no-Supabase fallback reads a local path.
+        blob = None
+        blob_name = ""
+        if file_path:
+            blob_name = os.path.basename(file_path)
+            if not os.path.exists(file_path):
+                try:
+                    from core.services.persistence import persistence
+                    blob = persistence.download_bytes(file_path)
+                except Exception as e:
+                    logger.error(f"🤖 Could not fetch attachment from storage: {e}")
+                if blob is None:
+                    self.send_state.update({"running": False, "last_error": "Attachment unavailable"})
+                    return {"status": "error", "message": "Attachment could not be retrieved from storage"}
+                logger.info(f"🤖 Attachment loaded from storage ({len(blob)/1048576:.1f} MB)")
+
+        # Telegram returns a reusable file_id after the first successful send;
+        # every later recipient references it instead of re-uploading.
+        cached_file_id = ""
+
         self.send_state.update({
             "running": True, "total": len(recips), "done": 0,
             "ok": 0, "failed": 0, "current": "", "last_error": "",
@@ -315,7 +375,8 @@ class MessageBot:
                 break
             who = ("@" + r["username"]) if r.get("username") else str(r.get("user_id") or r["id"])
             self.send_state["current"] = who
-            res = self.send_one(r, text, file_path, link, link_label, link_as_button)
+            res = self.send_one(r, text, file_path, link, link_label, link_as_button,
+                                blob=blob, blob_name=blob_name, file_id=cached_file_id)
 
             # Telegram asked us to slow down: wait exactly as long as it said, then
             # retry this recipient once. Ignoring retry_after is what gets bots limited.
@@ -324,12 +385,17 @@ class MessageBot:
                 self.send_state["current"] = f"Rate limited — waiting {wait}s"
                 logger.warning(f"🤖 Telegram rate limit hit, sleeping {wait}s before retrying {who}.")
                 time.sleep(wait)
-                res = self.send_one(r, text, file_path, link, link_label, link_as_button)
+                res = self.send_one(r, text, file_path, link, link_label, link_as_button,
+                                    blob=blob, blob_name=blob_name, file_id=cached_file_id)
 
             bot_store.mark_sent(r["id"], res["ok"], res.get("error", ""), label, res.get("kind", ""))
 
             self.send_state["done"] += 1
             if res["ok"]:
+                if res.get("file_id") and not cached_file_id:
+                    cached_file_id = res["file_id"]
+                    blob = None          # bytes no longer needed; free the memory
+                    logger.info("🤖 Attachment cached by Telegram; remaining sends reuse it.")
                 self.send_state["ok"] += 1
             else:
                 self.send_state["failed"] += 1

@@ -13,12 +13,13 @@ from flask import render_template, request, jsonify, session, redirect, url_for,
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from utils.logger import logger
+from utils.paths import UPLOAD_DIR as STATE_UPLOAD_DIR, LOGS_DIR, session_base, session_file
 from core.services.config_service import config_service
 from core.services.group_store import group_store
 from core.services.bot_store import bot_store
 from core.bot_manager import BotManager
 from core.group_monitor import GroupMonitorManager
-from core.message_bot import MessageBot, kind_for, MAX_UPLOAD_MB
+from core.message_bot import MessageBot, kind_for_name, MAX_UPLOAD_MB
 from pyrogram import Client
 from pyrogram.errors import (
     AuthKeyUnregistered, PhoneCodeInvalid, PhoneCodeExpired, 
@@ -129,7 +130,7 @@ def _get_accounts_state():
         p_clean = "".join(filter(str.isdigit, p))
         if p_clean not in processed:
             # If session file exists, the account is authenticated but worker is lazy-loading
-            has_session = os.path.exists(f"sessions/session_{p_clean}.session")
+            has_session = os.path.exists(session_file(p_clean))
             acct_settings = account_settings.get(p_clean, {})
             final_list.append({
                 "phone": p, "clean_phone": p_clean, "authenticated": has_session,
@@ -149,7 +150,7 @@ def _get_active_worker(phone: str):
     """Lazy-loading worker lookup."""
     p_clean = "".join(filter(str.isdigit, str(phone)))
     worker = bot_manager.get_worker(phone)
-    if not worker and _init_complete and os.path.exists(f"sessions/session_{p_clean}.session"):
+    if not worker and _init_complete and os.path.exists(session_file(p_clean)):
         # Auto-trigger initialization for authorized session (only after startup finishes)
         run_async(bot_manager.initialize())
         worker = bot_manager.get_worker(phone)
@@ -288,7 +289,7 @@ def register_routes(app, socketio):
             try: await asyncio.wait_for(worker.client.stop(), timeout=3.0)
             except: pass
             bot_manager.workers.pop(p_clean, None)
-        base = f"sessions/session_{p_clean}"
+        base = session_base(p_clean)
         for ext in [".session", ".session-journal"]:
             if os.path.exists(f"{base}{ext}"):
                 try: os.remove(f"{base}{ext}")
@@ -331,7 +332,8 @@ def register_routes(app, socketio):
     @token_required
     def get_logs():
         try:
-            with open("logs/bot.log", "r", errors="replace") as f: return "".join(f.readlines()[-100:])
+            with open(os.path.join(LOGS_DIR, "bot.log"), "r", errors="replace") as f:
+                return "".join(f.readlines()[-100:])
         except: return "No logs found."
 
     def _status_worker():
@@ -380,7 +382,7 @@ def register_routes(app, socketio):
             except: pass
         async def _logic():
             await _cleanup_reauth(phone)
-            client = Client(f"sessions/session_{p_clean}", api_id=int(api_id), api_hash=api_hash, workdir=".", device_model="iPhone 15 Pro Max", max_concurrent_transmissions=1)
+            client = Client(session_base(p_clean), api_id=int(api_id), api_hash=api_hash, workdir=".", device_model="iPhone 15 Pro Max", max_concurrent_transmissions=1)
             await client.connect()
             try:
                 sent = await client.send_code(phone)
@@ -591,7 +593,7 @@ def register_routes(app, socketio):
     # ──────────────────────────────────────────────
     # MESSAGE BOT
     # ──────────────────────────────────────────────
-    UPLOAD_DIR = os.path.join("data", "uploads")
+    UPLOAD_DIR = STATE_UPLOAD_DIR
 
     @app.route("/api/bot/state", methods=["GET"])
     @token_required
@@ -647,39 +649,52 @@ def register_routes(app, socketio):
     @app.route("/api/bot/upload", methods=["POST"])
     @token_required
     def bot_upload():
-        """Accept a file from the browser and hold it for the next send."""
+        """
+        Accept a file from the browser and put it in Supabase Storage.
+
+        Nothing is written to the VPS disk: the upload is read from the request
+        into memory and pushed straight to object storage. Local disk is used
+        only as a fallback when Supabase is not configured.
+        """
         f = request.files.get("file")
         if not f or not f.filename:
             return jsonify({"status": "error", "message": "No file received"}), 400
 
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-        # Prune attachments older than a day so uploads don't fill the disk.
-        cutoff = time.time() - 86400
-        for old in os.listdir(UPLOAD_DIR):
-            p = os.path.join(UPLOAD_DIR, old)
-            try:
-                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
-                    os.remove(p)
-            except Exception:
-                pass
-
-        safe = "".join(c if (c.isalnum() or c in "._- ") else "_" for c in os.path.basename(f.filename))
-        path = os.path.join(UPLOAD_DIR, f"{int(time.time())}_{safe}")
-        f.save(path)
-
-        size_mb = os.path.getsize(path) / (1024 * 1024)
+        data = f.read()
+        size_mb = len(data) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
-            os.remove(path)
             return jsonify({
                 "status": "error",
                 "message": f"File is {size_mb:.1f} MB — Telegram caps bot uploads at {MAX_UPLOAD_MB} MB",
             }), 400
 
-        return jsonify({
-            "status": "success", "path": path, "name": safe,
-            "size_mb": round(size_mb, 2), "kind": kind_for(path),
-        })
+        safe = "".join(c if (c.isalnum() or c in "._- ") else "_" for c in os.path.basename(f.filename))
+        stamped = f"{int(time.time())}_{safe}"
+        kind = kind_for_name(safe, size_mb)
+
+        from core.services.persistence import persistence
+        if persistence.enabled:
+            remote = f"uploads/{stamped}"
+            if not persistence.upload_bytes(remote, data, f.mimetype or "application/octet-stream"):
+                return jsonify({"status": "error", "message": "Could not store the file in Supabase"}), 502
+            return jsonify({"status": "success", "storage": "supabase", "path": remote,
+                            "name": safe, "size_mb": round(size_mb, 2), "kind": kind})
+
+        # No Supabase configured — fall back to disk so the feature still works.
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        cutoff = time.time() - 86400
+        for old in os.listdir(UPLOAD_DIR):
+            fp = os.path.join(UPLOAD_DIR, old)
+            try:
+                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+            except Exception:
+                pass
+        path = os.path.join(UPLOAD_DIR, stamped)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return jsonify({"status": "success", "storage": "disk", "path": path,
+                        "name": safe, "size_mb": round(size_mb, 2), "kind": kind})
 
     @app.route("/api/bot/send", methods=["POST"])
     @token_required
@@ -748,6 +763,47 @@ def register_routes(app, socketio):
     @socketio.on('request_sync')
     def handle_request_sync():
         socketio.emit("status_update", {"accounts": _get_accounts_state()})
+
+    # ──────────────────────────────────────────────
+    # EPHEMERAL STATE GUARD
+    # ──────────────────────────────────────────────
+    def _session_backup_worker():
+        """
+        When STATE_DIR is a tmpfs, RAM is not durable — a reboot wipes it and
+        Supabase is the only copy. config and both databases already upload on
+        every change, but .session files are only pushed at login even though
+        Pyrogram keeps writing peer cache and update state into them. Sync them
+        on a timer so a reboot loses minutes, not logins.
+        """
+        from utils.paths import is_ephemeral
+        if not is_ephemeral():
+            return
+        try:
+            from core.services.persistence import persistence
+            if not persistence.enabled:
+                logger.error(
+                    "STATE_DIR is in RAM but Supabase is NOT configured — "
+                    "all state will be lost on reboot. Set SUPABASE_URL/SUPABASE_KEY."
+                )
+                return
+        except Exception:
+            return
+
+        logger.info("💾 RAM-backed state detected; syncing sessions to Supabase every 15 min.")
+        while True:
+            time.sleep(900)
+            try:
+                from core.services.persistence import persistence
+                n = 0
+                for p_clean in list(bot_manager.workers.keys()):
+                    if persistence.backup_session(p_clean):
+                        n += 1
+                if n:
+                    logger.info(f"💾 Synced {n} session(s) to Supabase.")
+            except Exception as e:
+                logger.warning(f"💾 Session sync failed: {e}")
+
+    threading.Thread(target=_session_backup_worker, daemon=True).start()
 
     # ──────────────────────────────────────────────
     # KEEP-ALIVE: Prevent Render free tier spin-down

@@ -15,6 +15,8 @@ import json
 import threading
 import requests as http_requests   # alias to avoid shadowing
 from utils.logger import logger
+from utils.paths import (CONFIG_PATH, SESSIONS_DIR, GROUP_DB, BOT_DB,
+                         session_file, ensure_dirs)
 
 BUCKET = "telegram-sessions"
 
@@ -133,6 +135,43 @@ class PersistenceManager:
             logger.error(f"☁️ Delete error {remote_path}: {e}")
             return False
 
+    def upload_bytes(self, remote_path, data: bytes, content_type="application/octet-stream"):
+        """Upload raw bytes straight to Storage — no local file involved."""
+        if not self.enabled:
+            return False
+        try:
+            resp = http_requests.post(
+                f"{self._base}/{BUCKET}/{remote_path}",
+                headers={**self._headers, "Content-Type": content_type, "x-upsert": "true"},
+                data=data,
+                timeout=180,
+            )
+            if resp.status_code in (200, 201):
+                logger.info(f"☁️ Stored → {remote_path} ({len(data)/1048576:.1f} MB)")
+                return True
+            logger.error(f"☁️ Store failed {remote_path}: {resp.status_code} {resp.text[:200]}")
+            return False
+        except Exception as e:
+            logger.error(f"☁️ Store error {remote_path}: {e}")
+            return False
+
+    def download_bytes(self, remote_path):
+        """Fetch an object into memory. Returns bytes, or None."""
+        if not self.enabled:
+            return None
+        try:
+            resp = http_requests.get(
+                f"{self._base}/{BUCKET}/{remote_path}", headers=self._headers, timeout=180
+            )
+            return resp.content if resp.status_code == 200 else None
+        except Exception as e:
+            logger.error(f"☁️ Fetch error {remote_path}: {e}")
+            return None
+
+    def delete_path(self, remote_path):
+        """Delete one object from Storage."""
+        return self._delete(remote_path)
+
     def _list_files(self, prefix=""):
         """List files in a bucket path."""
         if not self.enabled:
@@ -211,21 +250,21 @@ class PersistenceManager:
     # ─────────────────────────────────────
     def backup_config(self):
         """Push config.json to Supabase."""
-        if os.path.exists("config.json"):
+        if os.path.exists(CONFIG_PATH):
             # Safety Check: Don't backup if the file is suspiciously small (default is ~150-200 bytes)
-            if os.path.getsize("config.json") < 100:
+            if os.path.getsize(CONFIG_PATH) < 100:
                 logger.warning("☁️ Config file suspiciously small, skipping cloud backup to prevent data loss.")
                 return False
-            return self._upload("config/config.json", "config.json", "application/json")
+            return self._upload("config/config.json", CONFIG_PATH, "application/json")
         return False
 
     def restore_config(self):
         """Pull config.json from Supabase to local disk."""
-        return self._download("config/config.json", "config.json")
+        return self._download("config/config.json", CONFIG_PATH)
 
     def backup_session(self, clean_phone):
         """Push a single .session file to Supabase."""
-        local = f"sessions/session_{clean_phone}.session"
+        local = session_file(clean_phone)
         if os.path.exists(local):
             return self._upload(f"sessions/session_{clean_phone}.session", local)
         return False
@@ -237,7 +276,7 @@ class PersistenceManager:
         for f in files:
             name = f.get("name", "")
             if name.endswith(".session"):
-                if self._download(f"sessions/{name}", f"sessions/{name}"):
+                if self._download(f"sessions/{name}", os.path.join(SESSIONS_DIR, name)):
                     restored += 1
         if restored:
             logger.info(f"☁️ Restored {restored} session file(s) from cloud.")
@@ -249,7 +288,7 @@ class PersistenceManager:
 
     def backup_group_db(self):
         """Push the group monitor database to Supabase."""
-        local = "data/group_monitor.db"
+        local = GROUP_DB
         if not os.path.exists(local):
             return False
         # Fold the WAL into the main file first, or the upload misses recent writes.
@@ -262,11 +301,11 @@ class PersistenceManager:
 
     def restore_group_db(self):
         """Pull the group monitor database from Supabase."""
-        ok = self._download("data/group_monitor.db", "data/group_monitor.db")
+        ok = self._download("data/group_monitor.db", GROUP_DB)
         if ok:
             # The local empty DB created at import leaves -wal/-shm behind; stale
             # sidecars against a freshly downloaded file confuse SQLite.
-            for sidecar in ("data/group_monitor.db-wal", "data/group_monitor.db-shm"):
+            for sidecar in (GROUP_DB + "-wal", GROUP_DB + "-shm"):
                 try:
                     if os.path.exists(sidecar):
                         os.remove(sidecar)
@@ -276,7 +315,7 @@ class PersistenceManager:
 
     def backup_bot_db(self):
         """Push the message bot database (token + recipients) to Supabase."""
-        local = "data/message_bot.db"
+        local = BOT_DB
         if not os.path.exists(local):
             return False
         try:
@@ -288,9 +327,9 @@ class PersistenceManager:
 
     def restore_bot_db(self):
         """Pull the message bot database from Supabase."""
-        ok = self._download("data/message_bot.db", "data/message_bot.db")
+        ok = self._download("data/message_bot.db", BOT_DB)
         if ok:
-            for sidecar in ("data/message_bot.db-wal", "data/message_bot.db-shm"):
+            for sidecar in (BOT_DB + "-wal", BOT_DB + "-shm"):
                 try:
                     if os.path.exists(sidecar):
                         os.remove(sidecar)
@@ -302,9 +341,7 @@ class PersistenceManager:
         """Full restore: config + sessions + group monitor DB + message bot DB."""
         if not self.enabled:
             return
-        os.makedirs("sessions", exist_ok=True)
-        os.makedirs("logs", exist_ok=True)
-        os.makedirs("data", exist_ok=True)
+        ensure_dirs()
         logger.info("☁️ Restoring data from Supabase...")
         self.restore_config()
         self.restore_all_sessions()

@@ -19,9 +19,9 @@ import time
 from typing import List, Dict, Optional
 
 from utils.logger import logger
+from utils.paths import GROUP_DB
 
-DB_DIR = "data"
-DB_PATH = os.path.join(DB_DIR, "group_monitor.db")
+DB_PATH = GROUP_DB
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -87,8 +87,8 @@ def _sync_cloud():
 
 
 class GroupStore:
-    def __init__(self, path: str = DB_PATH):
-        self.path = path
+    def __init__(self, path: str = None):
+        self.path = path or DB_PATH
         self._lock = threading.RLock()
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._init_schema()

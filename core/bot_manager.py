@@ -6,6 +6,7 @@ from pyrogram.errors import AuthKeyUnregistered
 from core.bot_worker import BotWorker
 from utils.logger import logger
 from core.services.config_service import config_service
+from utils.paths import SESSIONS_DIR, session_base, session_file
 
 class BotManager:
     """
@@ -29,8 +30,8 @@ class BotManager:
                 logger.info(f"🔧 Init: {len(phones)} phone(s) registered, API creds={'✅' if has_api else '❌ MISSING'}")
             
             # Identify active session files on disk
-            session_dir = "sessions"
-            if not os.path.exists(session_dir): os.makedirs(session_dir)
+            session_dir = SESSIONS_DIR
+            os.makedirs(session_dir, exist_ok=True)
             
             for phone in phones:
                 p_clean = self._clean_id(phone)
@@ -42,8 +43,7 @@ class BotManager:
                     logger.warning(f"ℹ️ {phone}: Skipping initialization. Global API ID/Hash not set in Config.")
                     continue
 
-                session_file = f"{session_dir}/session_{p_clean}"
-                if os.path.exists(f"{session_file}.session"):
+                if os.path.exists(session_file(p_clean)):
                     logger.info(f"🔍 Found session for {phone}. Initializing...")
                     await self._start_worker(phone, p_clean, config)
                 else:
@@ -63,7 +63,7 @@ class BotManager:
                     targets = global_targets
 
             client = Client(
-                f"sessions/session_{p_clean}",
+                session_base(p_clean),
                 api_id=int(config["api_id"]),
                 api_hash=config["api_hash"],
                 workdir=".",
@@ -77,8 +77,8 @@ class BotManager:
             
             if not is_authorized:
                 logger.error(f"❌ [{phone}] Session file exists but is NOT authorized. Deleting corrupted session.")
-                if os.path.exists(f"sessions/session_{p_clean}.session"):
-                    os.remove(f"sessions/session_{p_clean}.session")
+                if os.path.exists(session_file(p_clean)):
+                    os.remove(session_file(p_clean))
                 try:
                     from core.services.persistence import persistence
                     persistence.delete_session(p_clean)

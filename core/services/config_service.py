@@ -2,10 +2,11 @@ import json
 import os
 import tempfile
 from utils.logger import logger
+from utils.paths import CONFIG_PATH
 
 class ConfigService:
-    def __init__(self, config_path="config.json"):
-        self.config_path = config_path
+    def __init__(self, config_path=None):
+        self.config_path = config_path or CONFIG_PATH
 
     def load(self):
         if not os.path.exists(self.config_path):
@@ -27,7 +28,7 @@ class ConfigService:
             return self._defaults()
 
     def save(self, config):
-        fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(self.config_path))
+        fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(self.config_path) or ".")
         try:
             with os.fdopen(fd, 'w') as f:
                 json.dump(config, f, indent=4)

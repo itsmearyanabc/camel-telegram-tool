@@ -171,3 +171,52 @@ be at least 60M in the server block; reload nginx after fixing.
 **Telegram logins vanish after redeploy** — you wiped `/opt/armedias`. Restore
 from Supabase by setting the keys in `.env` and restarting; the app pulls
 sessions and both databases back on boot.
+
+
+---
+
+## Zero-disk mode (all state in Supabase)
+
+By default the app keeps its state in `/opt/telegram-tool`. To write **nothing**
+to persistent disk:
+
+```bash
+sudo bash /opt/telegram-tool/deploy/zero-disk.sh
+```
+
+| What | Default | Zero-disk |
+|---|---|---|
+| Telegram sessions | `sessions/` on disk | `/run/telegram-tool` (RAM) |
+| Both databases | `data/*.db` on disk | `/run/telegram-tool` (RAM) |
+| `config.json` | on disk | `/run/telegram-tool` (RAM) |
+| File attachments | `data/uploads/` on disk | Supabase Storage, never on disk |
+| Logs | `logs/bot.log` | journald only |
+
+Supabase becomes the single durable copy — state uploads within seconds of any
+change and is pulled back into RAM at boot. The script verifies a real Supabase
+round-trip and backs up existing state *before* it removes anything, and refuses
+to run if Supabase is not working.
+
+The application code and virtualenv (~300 MB) stay on disk. Python has to load
+them from a filesystem; that part cannot move.
+
+**The trade-off:** if Supabase is unreachable at boot, the app starts empty and
+Telegram accounts need logging in again. Sessions additionally sync every 15
+minutes, since Pyrogram keeps writing to them after login.
+
+To revert:
+
+```bash
+sudo rm /etc/systemd/system/telegram-tool.service.d/zero-disk.conf && sudo systemctl daemon-reload && sudo systemctl restart telegram-tool
+```
+
+## Checking the whole box
+
+```bash
+sudo bash /opt/telegram-tool/deploy/vps-status.sh
+```
+
+Read-only. Lists every listening socket, systemd service, PM2 process and
+Docker container, all nginx sites and certificates, disk per project, and runs
+an isolation check on this app — that it binds loopback only, runs unprivileged,
+uses a single worker, and that no other site references its directory.
