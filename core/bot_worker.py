@@ -136,6 +136,79 @@ class BotWorker:
         config = config_service.load()
         return config.get("source_channel", "").strip()
 
+    @staticmethod
+    def _source_refs(source: str, known_id=None):
+        """
+        Every way we can name the source chat, most resolvable first.
+
+        A username is resolved by Telegram on request. A numeric id only works
+        if its access_hash is already in this session's local peer cache.
+        """
+        refs = []
+        src = str(source or "").strip()
+        if src:
+            low = src.lower()
+            for scheme in ("https://", "http://"):
+                if low.startswith(scheme):
+                    src = src[len(scheme):]
+                    break
+            if "t.me/" in src.lower():
+                src = src.split("t.me/")[-1].split("/")[0]
+            src = src.split("?")[0].strip("/").lstrip("@")
+            if src and not src.lstrip("-").isdigit():
+                refs.append(src)
+            elif src:
+                try:
+                    refs.append(int(src))
+                except ValueError:
+                    pass
+        if known_id is not None:
+            try:
+                kid = int(known_id)
+                if kid not in refs:
+                    refs.append(kid)
+            except (TypeError, ValueError):
+                pass
+        return refs
+
+    async def _ensure_source_peer(self):
+        """
+        Make the SOURCE chat resolvable before forwarding anything.
+
+        forward_messages() takes from_chat_id, and a bare numeric id only works
+        when the access_hash sits in this session's peer cache. That cache lives
+        inside the .session file, so restoring a session from backup — which a
+        RAM-backed (zero-disk) install does on every boot — can leave it cold.
+
+        When that happens EVERY target fails with the same
+        "Peer id invalid: <source id>", which reads like a broken target list
+        but is nothing of the sort. Resolving the source by username re-caches
+        it and the whole campaign starts working again.
+
+        Returns (ok, error).
+        """
+        refs = self._source_refs(self._get_resolved_source(), self.current_from_chat)
+        if not refs:
+            return False, "No source channel configured"
+
+        last = ""
+        for ref in refs:
+            try:
+                chat = await self.client.get_chat(ref)
+            except Exception as e:
+                last = str(e)
+                continue
+            if self.current_from_chat and chat.id != self.current_from_chat:
+                # Telegram is the authority; a supergroup migration moves the id.
+                logger.info(f"[{self.phone}] Source chat id changed "
+                            f"{self.current_from_chat} -> {chat.id}; updating.")
+                self.current_from_chat = chat.id
+                self._persist_state()
+            elif not self.current_from_chat:
+                self.current_from_chat = chat.id
+            return True, ""
+        return False, last or "Could not resolve the source channel"
+
     async def _setup_monitor(self):
         if not self.client.is_connected: return
 
@@ -264,6 +337,27 @@ class BotWorker:
             if not self.targets:
                 await self.progress.set_action("Error: No targets configured")
                 return False
+
+            # Do this once per campaign, not once per target: if the source
+            # cannot be resolved, every single forward fails identically and
+            # the reason belongs on the source, not smeared across the pool.
+            ok, why = await self._ensure_source_peer()
+            if not ok:
+                msg = (f"Source channel unreachable ({why}). "
+                       f"Check the account is still in it.")
+                logger.error(f"[{self.phone}] {msg}")
+                await self.progress.set_action(f"❌ {msg}")
+                self._reset_target_results()
+                for t in self.targets:
+                    self._mark_target(t, "failed", msg)
+                self._persist_target_results()
+                return False
+
+            # The resolver may have followed a migration. For a re-forward the
+            # resolved id is the right one; for a live message the handler's own
+            # chat id is authoritative, since message_id belongs to that chat.
+            if not is_new_message and self.current_from_chat:
+                from_chat_id = self.current_from_chat
                 
             # Queue Flush: clear pending sends without replacing the queue object
             while not self.queue.empty():
@@ -395,6 +489,12 @@ class BotWorker:
                     return False, "MessageIdInvalid"
                 if "FORBIDDEN" in err_str or "RESTRICTED" in err_str or "BANNED" in err_str:
                     return False, "Permission Denied"
+                # A peer-invalid naming the SOURCE is not this target's fault.
+                if "peer id invalid" in err_str.lower():
+                    if str(self.current_from_chat) in err_str:
+                        return False, ("Source channel not resolvable "
+                                       "— the account may have left it")
+                    return False, "Target not resolvable (check the @username)"
                 if attempt < 3: await asyncio.sleep(2 ** attempt)
                 else: return False, err_str
         return False, "Max Retries"
