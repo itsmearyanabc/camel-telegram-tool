@@ -253,9 +253,12 @@
 
 <!-- SESSION SETTINGS MODAL -->
 <div class="overlay" id="settings-modal">
-  <div class="modal gm-wide" style="text-align: left;">
-    <h3>Session Settings</h3>
-    <p id="modal-phone" style="color:var(--text2); font-size:.85rem; margin-bottom:16px"></p>
+  <div class="modal tall-modal">
+    <div class="tall-head">
+      <h3>Session Settings</h3>
+      <p id="modal-phone" style="color:var(--text2); font-size:.85rem; margin:0"></p>
+    </div>
+    <div class="tall-body">
     <input type="hidden" id="edit-phone">
     <div class="fg"><label>Account Nickname</label><input type="text" id="edit-nickname" class="input" placeholder="e.g. Main Account, Backup, etc."></div>
     <div class="fg"><label>Source Channel / Group</label><input type="text" id="edit-source" class="input" placeholder="@channel (Leave empty for Global)"></div>
@@ -295,9 +298,10 @@
       </div>
       <p class="tp-note" id="tp-note"></p>
     </div>
-    <div style="display:flex; gap:10px; margin-top:20px">
+    </div>
+    <div class="tall-foot">
       <button class="btn btn-s" onclick="closeModal()"><i class="fas fa-arrow-left"></i> Back</button>
-      <button class="btn btn-p" onclick="saveSessionSettings()">Save Settings</button>
+      <button class="btn btn-p" style="flex:1" onclick="saveSessionSettings()">Save Settings</button>
     </div>
   </div>
 </div>
