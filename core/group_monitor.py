@@ -274,6 +274,49 @@ class GroupMonitorManager:
                     logger.warning(f"👁 attach failed for {g['chat_key']}: {e}")
 
     # ─────────────────────────────────────
+    # PEER RESOLUTION
+    # ─────────────────────────────────────
+    @staticmethod
+    def _lookup_refs(group: Dict) -> List:
+        """
+        Every way we know to name this chat, best first.
+
+        A username (or invite link) is resolved by Telegram on request, so it
+        works even from a session that has never seen the chat. A bare numeric
+        id only works if the peer's access_hash is already in the session's
+        local cache — and that cache lives inside the .session file, so it is
+        lost whenever a session is restored from a backup taken before the chat
+        was first seen. On a RAM-backed (zero-disk) install that happens on
+        every restart, which is why the id alone is not enough.
+        """
+        refs = []
+        if group.get("username"):
+            refs.append(group["username"])
+        ref = str(group.get("source_ref") or "").strip()
+        if ref and not ref.lstrip("-").isdigit() and ref not in refs:
+            refs.append(ref)
+        if group.get("chat_id"):
+            refs.append(int(group["chat_id"]))
+        return refs
+
+    async def _resolve_chat(self, client, group: Dict):
+        """
+        Get a live Chat, re-caching the peer as a side effect.
+
+        Returns (chat, error). Trying the username first is what repairs a cold
+        cache: once get_chat succeeds, the access_hash is stored and later calls
+        that take a numeric id start working again.
+        """
+        last = ""
+        for ref in self._lookup_refs(group):
+            try:
+                return await client.get_chat(ref), ""
+            except Exception as e:
+                last = str(e)
+                continue
+        return None, last or "Could not resolve this chat"
+
+    # ─────────────────────────────────────
     # ROSTER SYNC (the reliable path)
     # ─────────────────────────────────────
     async def sync_group(self, chat_key: str) -> Dict:
@@ -294,7 +337,28 @@ class GroupMonitorManager:
         seen_ids, joined, left = set(), 0, 0
 
         try:
-            async for member in client.get_chat_members(group["chat_id"]):
+            # Resolve first: this both warms the peer cache and catches a group
+            # the account has been removed from, with a message that says so.
+            chat, err = await self._resolve_chat(client, group)
+            if chat is None:
+                friendly = (
+                    f"Could not resolve this group ({err}). The watching account "
+                    f"may have been removed from it, or its username changed."
+                )
+                group_store.upsert_group(chat_key, last_error=friendly[:300],
+                                         last_sync=time.time())
+                logger.error(f"👁 [{group['title']}] {friendly}")
+                return {"status": "error", "message": friendly}
+
+            # Telegram is the authority on the id and title; a supergroup
+            # migration changes the id under us.
+            if chat.id != group["chat_id"]:
+                logger.info(f"👁 [{group['title']}] chat id changed "
+                            f"{group['chat_id']} -> {chat.id}; updating.")
+                group_store.upsert_group(chat_key, chat_id=chat.id)
+                group["chat_id"] = chat.id
+
+            async for member in client.get_chat_members(chat.id):
                 user = _user_dict(getattr(member, "user", None))
                 if not user:
                     continue
@@ -309,7 +373,10 @@ class GroupMonitorManager:
                         left += 1
 
             group_store.upsert_group(
-                chat_key, last_sync=time.time(), last_error=None, member_count=len(seen_ids)
+                chat_key, last_sync=time.time(), last_error=None,
+                member_count=len(seen_ids),
+                title=getattr(chat, "title", None) or group.get("title"),
+                username=getattr(chat, "username", None),
             )
             label = "Baseline captured" if baseline else "Synced"
             logger.info(
