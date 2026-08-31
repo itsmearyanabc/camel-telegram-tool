@@ -299,6 +299,130 @@ def register_routes(app, socketio):
             run_async(worker.update_targets(targets))
         return jsonify({"status": "success", "targets": targets, "count": len(targets)})
 
+    @app.route("/api/session/diagnose", methods=["GET", "POST"])
+    @token_required
+    def session_diagnose():
+        """
+        Say, per target, exactly why a forward will or will not work.
+
+        Runs on the live worker's own client, so it reuses the connection the
+        app already holds — a second process opening the same .session file
+        would fight it for the SQLite lock and confuse Telegram about the
+        session. Returns plain text, because this is read in a terminal.
+
+        Deliberately not on run_async: checking twenty targets is twenty
+        network round-trips and would blow its 30s budget.
+        """
+        phone = (request.args.get("phone")
+                 or (request.get_json(silent=True) or {}).get("phone") or "").strip()
+
+        workers = ([bot_manager.get_worker(phone)] if phone
+                   else list(bot_manager.workers.values()))
+        workers = [w for w in workers if w]
+        if not workers:
+            return Response("No loaded account matches that phone.\n",
+                            mimetype="text/plain", status=404)
+
+        async def _run():
+            lines = []
+            for w in workers:
+                lines.append("=" * 72)
+                lines.append(f"ACCOUNT {w.phone}")
+                lines.append("=" * 72)
+
+                if not (w.client and w.client.is_connected):
+                    lines.append("  client NOT CONNECTED — nothing can send.\n")
+                    continue
+
+                # ── the account itself ──
+                try:
+                    me = await w.client.get_me()
+                    flags = []
+                    for attr in ("is_restricted", "is_scam", "is_fake", "is_deleted"):
+                        if getattr(me, attr, False):
+                            flags.append(attr)
+                    lines.append(f"  identity   : {me.first_name or ''} "
+                                 f"(@{me.username or 'no username'}) id={me.id}")
+                    lines.append(f"  account    : {'⚠ ' + ', '.join(flags) if flags else 'OK, no restriction flags'}")
+                    if flags:
+                        lines.append("               A restricted account is refused write access "
+                                     "everywhere — that alone explains ChatWriteForbidden on every target.")
+                except Exception as e:
+                    lines.append(f"  identity   : could not read ({e})")
+
+                # ── the source ──
+                src = w._get_resolved_source() or "(none)"
+                lines.append(f"  source cfg : {src}")
+                ok, why = await w._ensure_source_peer()
+                lines.append(f"  source     : {'OK, resolves' if ok else '✗ ' + why}")
+                if ok and w.current_msg_id:
+                    try:
+                        m = await w.client.get_messages(w.current_from_chat, w.current_msg_id)
+                        alive = bool(m and not getattr(m, "empty", False))
+                        lines.append(f"  message    : #{w.current_msg_id} "
+                                     f"{'exists' if alive else '✗ DELETED — post a new one in the source'}")
+                    except Exception as e:
+                        lines.append(f"  message    : #{w.current_msg_id} ✗ unreadable ({str(e)[:80]})")
+                elif ok:
+                    lines.append("  message    : none captured yet — waiting for a source post")
+
+                # ── each target ──
+                lines.append(f"  targets    : {len(w.targets)}")
+                lines.append("")
+                lines.append("    %-34s %-12s %-10s %s" % ("TARGET", "RESOLVES", "MEMBER", "VERDICT"))
+                lines.append("    " + "-" * 84)
+
+                counts = {"ready": 0, "not_member": 0, "dead": 0, "restricted": 0}
+                for t in w.targets:
+                    try:
+                        chat = await w.client.get_chat(t)
+                    except Exception as e:
+                        msg = str(e)
+                        dead = ("USERNAME_NOT_OCCUPIED" in msg
+                                or "Username not found" in msg
+                                or "USERNAME_INVALID" in msg)
+                        counts["dead" if dead else "restricted"] += 1
+                        lines.append("    %-34s %-12s %-10s %s" % (
+                            t[:34], "NO", "-",
+                            "channel does not exist — remove it" if dead else msg[:44]))
+                        continue
+
+                    status, can = "unknown", "?"
+                    try:
+                        mem = await w.client.get_chat_member(chat.id, "me")
+                        raw = getattr(mem, "status", None)
+                        status = str(getattr(raw, "value", raw)).lower().replace(
+                            "chatmemberstatus.", "")
+                    except Exception:
+                        status = "not a member"
+
+                    if status in ("banned", "kicked", "left", "not a member"):
+                        verdict = "JOIN this group with this account"
+                        counts["not_member"] += 1
+                    elif status == "restricted":
+                        verdict = "muted/restricted here — cannot post"
+                        counts["restricted"] += 1
+                    else:
+                        verdict = "should work"
+                        counts["ready"] += 1
+
+                    lines.append("    %-34s %-12s %-10s %s" % (
+                        t[:34], "yes", status[:10], verdict))
+
+                lines.append("")
+                lines.append(f"  SUMMARY: {counts['ready']} should work · "
+                             f"{counts['not_member']} need joining · "
+                             f"{counts['restricted']} restricted · "
+                             f"{counts['dead']} dead usernames")
+                lines.append("")
+            return "\n".join(lines) + "\n"
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_run(), _BOT_LOOP)
+            return Response(fut.result(timeout=300), mimetype="text/plain")
+        except Exception as e:
+            return Response(f"Diagnosis failed: {e}\n", mimetype="text/plain", status=500)
+
     @app.route("/api/session/rename", methods=["POST"])
     @token_required
     def session_rename():
