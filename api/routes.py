@@ -13,6 +13,8 @@ from flask import render_template, request, jsonify, session, redirect, url_for,
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from utils.logger import logger
+# Widens pyrogram 2.0.106's channel-id bound; must load before any Client.
+from utils import pyrogram_compat  # noqa: F401
 from utils.paths import UPLOAD_DIR as STATE_UPLOAD_DIR, LOGS_DIR, session_base, session_file
 from core.services.config_service import config_service
 from core.services.group_store import group_store

@@ -5,6 +5,7 @@ from pyrogram import Client
 from pyrogram.errors import AuthKeyUnregistered
 from core.bot_worker import BotWorker
 from utils.logger import logger
+from utils import pyrogram_compat  # noqa: F401  (widens the channel-id bound)
 from core.services.config_service import config_service
 from utils.paths import SESSIONS_DIR, session_base, session_file
 

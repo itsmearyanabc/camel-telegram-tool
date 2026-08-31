@@ -390,7 +390,34 @@ WS   bot_update (5s) · bot_progress (per recipient)
 
 ---
 
-## 9. Anti-flood behaviour
+## 9. The Pyrogram channel-id patch
+
+`utils/pyrogram_compat.py` widens one constant in the installed library and is
+imported by `api/routes.py` and `core/bot_manager.py` before any `Client` exists.
+
+pyrogram 2.0.106 hard-codes `MIN_CHANNEL_ID = -1002147483647`, assuming a
+channel's raw id fits in 32 bits. Telegram moved past that: a recently created
+channel gets an id like `-1004451192738`, and `utils.get_peer_type()` raises
+`ValueError: Peer id invalid` for every one of them.
+
+It is easy to misread, because a **cached** peer is returned by
+`get_peer_by_id()` *before* the range check runs. So an account works fine until
+its session is restored from backup — which the zero-disk install does on every
+boot — and then every numeric lookup fails at once: forwards, roster syncs, and
+unhandled `Client.handle_updates()` task exceptions.
+
+The patch allows a 40-bit raw id. It cannot collide with the chat range, since
+`get_peer_type` tests `MIN_CHAT_ID` (-2_147_483_647) first and that window is
+nowhere near -1e12. Official Pyrogram has shipped nothing since 2.0.106, so
+there is no upgrade; the maintained forks fix it, but this project deliberately
+left an unofficial fork behind (§4), and one integer is far less to audit.
+
+**Resolving by username sidesteps the bound entirely** — that is why
+`group_monitor._resolve_chat()` and `BotWorker._ensure_source_peer()` try a
+username first. Keep both: the patch fixes the range, the username path also
+repairs a cold cache.
+
+## 10. Anti-flood behaviour
 
 `_send_msg` retries 3x with exponential backoff (2s, 4s). `FloodWait` sets
 `cooldown_until = monotonic() + e.value + 5` and the queue processor blocks on it, ticking a
