@@ -70,20 +70,86 @@ class BotWorker:
         """Ensure no duplicate starts and return safe response."""
         if self.is_running:
             return False, "Already running"
-        
+
         self.is_running = True
         await self.worker_manager.start_loop(self._process_queue)
         await self._setup_monitor()
-        
-        if self.current_msg_id:
-            # IMMEDIATELY queue the pending messages on restart
-            # This avoids the Render 15-minute sleep deadlock where the bot waits 15 mins,
-            # gets shut down by Render for inactivity, and never actually sends the message.
-            logger.info(f"[{self.phone}] Immediate dispatch on resume to avoid sleep deadlock.")
-            await self.trigger_dispatch()
-            
+
+        # Everything slow happens off to the side, so the Start button returns
+        # immediately instead of racing run_async's 30s budget.
+        asyncio.ensure_future(self._prime())
+
         logger.info(f"[{self.phone}] Worker started successfully.")
         return True, "Started"
+
+    async def _prime(self):
+        """
+        Get the worker into a state where it can actually forward.
+
+        Three things, in this order, because each unblocks the next:
+
+        1. WARM THE PEER CACHE. Pyrogram cannot even parse an update from a
+           channel whose access_hash it does not know — handle_updates() raises
+           and the message is discarded before any handler sees it. So a cold
+           session does not merely fail to forward, it never NOTICES the new
+           post at all. Warming has to happen before we sit waiting for updates,
+           not lazily on the first dispatch.
+
+        2. ADOPT THE LATEST SOURCE MESSAGE. The handler only ever sees posts
+           made after it attaches, so the natural order — write the post, then
+           press Start — captured nothing and the campaign sat idle forever with
+           no explanation. Reading the newest message already in the channel
+           makes that order work.
+
+        3. DISPATCH IMMEDIATELY if we now have something. On a resumed campaign
+           this also beats an idle host putting the process to sleep before the
+           first interval elapses.
+        """
+        try:
+            if not self._peers_warmed:
+                await self._warm_peer_cache()
+
+            if not self.current_msg_id:
+                await self._adopt_latest_source_message()
+
+            if self.current_msg_id:
+                logger.info(f"[{self.phone}] Priming dispatch for message "
+                            f"#{self.current_msg_id}.")
+                await self.trigger_dispatch()
+            else:
+                await self.progress.set_action(
+                    "Waiting for a new message in the source channel...")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[{self.phone}] Priming failed: {e}")
+
+    async def _adopt_latest_source_message(self):
+        """
+        Take the newest message already sitting in the source channel.
+
+        Without this the worker is deaf to anything posted before it started,
+        which is the order almost everyone uses.
+        """
+        ok, why = await self._ensure_source_peer()
+        if not ok:
+            logger.warning(f"[{self.phone}] Cannot read the source to adopt a "
+                           f"message: {why}")
+            return False
+        try:
+            async for m in self.client.get_chat_history(self.current_from_chat, limit=1):
+                if not m or getattr(m, "empty", False):
+                    continue
+                self.current_msg_id = m.id
+                self.current_from_chat = m.chat.id
+                self._persist_state()
+                logger.info(f"[{self.phone}] Adopted existing source message "
+                            f"#{m.id} (posted before start).")
+                return True
+            logger.info(f"[{self.phone}] Source channel has no messages yet.")
+        except Exception as e:
+            logger.warning(f"[{self.phone}] Could not read source history: {e}")
+        return False
 
     async def stop(self):
         self.is_running = False
