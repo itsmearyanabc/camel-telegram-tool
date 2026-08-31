@@ -175,7 +175,9 @@ class MessageBot:
     # BOT SETUP
     # ─────────────────────────────────────
     def verify_and_save(self, token: str) -> Dict:
-        token = (token or "").strip()
+        # str() first: "or" only catches falsy, so a number or list still
+        # reaches .strip() and raises.
+        token = str(token or "").strip()
         if not token:
             return {"status": "error", "message": "Bot token required"}
         res = self._call("getMe", token=token)
@@ -455,6 +457,21 @@ class MessageBot:
                       link: str = "", link_label: str = "", link_as_button: bool = True,
                       delay: float = 1.5, on_progress=None) -> Dict:
         """Blocking send. Call from a worker thread — start_campaign does that."""
+        try:
+            return self._send_campaign_inner(
+                recipient_ids, text, file_path, link, link_label,
+                link_as_button, delay, on_progress)
+        finally:
+            # start_campaign claims the slot synchronously; if anything in here
+            # raises, only this releases it. Otherwise send_state stays
+            # running=True and every later send is refused as "already in
+            # progress" until the process restarts.
+            self.send_state["running"] = False
+            self.send_state["current"] = ""
+
+    def _send_campaign_inner(self, recipient_ids: List[int], text: str = "", file_path: str = "",
+                             link: str = "", link_label: str = "", link_as_button: bool = True,
+                             delay: float = 1.5, on_progress=None) -> Dict:
         recips = bot_store.get_recipients_by_ids(recipient_ids)
 
         # Pull the attachment into memory once. Supabase-stored uploads never
@@ -697,6 +714,21 @@ class MessageBot:
                                        link: str = "", link_label: str = "",
                                        delay: float = 8.0, on_progress=None) -> Dict:
         """Account-mode campaign. Runs as a task on _BOT_LOOP, not a thread."""
+        try:
+            return await self._send_campaign_as_account_inner(
+                recipient_ids, account_phone, text, file_path,
+                link, link_label, delay, on_progress)
+        finally:
+            # Same reasoning as the bot path: the slot is claimed before the
+            # task starts, so only a finally can be trusted to give it back.
+            self.send_state["running"] = False
+            self.send_state["current"] = ""
+
+    async def _send_campaign_as_account_inner(self, recipient_ids: List[int],
+                                              account_phone: str = "", text: str = "",
+                                              file_path: str = "", link: str = "",
+                                              link_label: str = "", delay: float = 8.0,
+                                              on_progress=None) -> Dict:
         client, why = self._account_client(account_phone)
         if not client:
             self.send_state.update({"running": False, "last_error": why})

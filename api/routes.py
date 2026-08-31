@@ -111,6 +111,31 @@ def token_required(f):
 # ──────────────────────────────────────────────
 # CORE LOGIC HELPER
 # ──────────────────────────────────────────────
+def _s(data, key, default=""):
+    """
+    Read a request field as a trimmed string.
+
+    JSON clients send null, HTML forms send "", and .get(key, "") only covers a
+    MISSING key — a present-but-null one sails through and blows up on .strip().
+    """
+    v = data.get(key)
+    return default if v is None else str(v).strip()
+
+
+def _n(data, key, default, cast=int, lo=None, hi=None):
+    """Read a numeric field, falling back to the default on junk rather than 500."""
+    try:
+        v = data.get(key)
+        out = default if v is None or v == "" else cast(v)
+    except (TypeError, ValueError):
+        out = default
+    if lo is not None:
+        out = max(lo, out)
+    if hi is not None:
+        out = min(hi, out)
+    return out
+
+
 def _saved_target_results(acct_settings):
     """Last known per-target verdict from config, in the worker's list shape."""
     saved = acct_settings.get("target_results") or {}
@@ -248,14 +273,14 @@ def register_routes(app, socketio):
         config = config_service.load(); settings = config.setdefault("account_settings", {}).setdefault(p_clean, {})
         settings.update({
             "source_channel": data.get("source_channel"), 
-            "loop_interval": int(data.get("loop_interval", 15)), 
-            "targets": data.get("targets", []), 
-            "msg_delay": int(data.get("msg_delay", 5)),
+            "loop_interval": _n(data, "loop_interval", 15, lo=1),
+            "targets": data.get("targets") or [],
+            "msg_delay": _n(data, "msg_delay", 5, lo=0),
             "nickname": data.get("nickname", settings.get("nickname", ""))
         })
         config_service.save(config)
         worker = _get_active_worker(phone)
-        if worker: run_async(worker.update_settings(data.get("source_channel"), int(data.get("loop_interval", 15)), data.get("targets", []), int(data.get("msg_delay", 5))))
+        if worker: run_async(worker.update_settings(data.get("source_channel"), _n(data, "loop_interval", 15, lo=1), data.get("targets") or [], _n(data, "msg_delay", 5, lo=0)))
         return jsonify({"status": "success"})
 
     @app.route("/api/session/targets", methods=["POST"])
@@ -274,7 +299,9 @@ def register_routes(app, socketio):
         if not p_clean:
             return jsonify({"status": "error", "message": "Phone required"}), 400
 
-        raw = data.get("targets", [])
+        # A JSON null slips past .get(k, default): the default applies only
+        # when the key is missing, not when it is present and null.
+        raw = data.get("targets") or []
         if isinstance(raw, str):
             raw = raw.split("\n")
         seen, targets = set(), []
@@ -429,7 +456,7 @@ def register_routes(app, socketio):
         """Set or update the nickname for an account."""
         data = request.get_json() or {}
         phone = data.get("phone", ""); p_clean = "".join(filter(str.isdigit, str(phone)))
-        nickname = data.get("nickname", "").strip()
+        nickname = _s(data, "nickname")
         config = config_service.load()
         settings = config.setdefault("account_settings", {}).setdefault(p_clean, {})
         settings["nickname"] = nickname
@@ -444,12 +471,14 @@ def register_routes(app, socketio):
         data = request.get_json(silent=True)
         if not data:
             data = request.form.to_dict()
+        # Any of these can arrive as null from a JSON client or blank from the
+        # form, so coerce before calling .strip() or int() on them.
         config.update({
-            "api_id": data.get("api_id", "").strip(), 
-            "api_hash": data.get("api_hash", "").strip(), 
-            "source_channel": data.get("source_channel", "").strip(), 
-            "loop_interval": int(data.get("loop_interval", 15)), 
-            "msg_delay": int(data.get("msg_delay", 5))
+            "api_id": _s(data, "api_id"),
+            "api_hash": _s(data, "api_hash"),
+            "source_channel": _s(data, "source_channel"),
+            "loop_interval": _n(data, "loop_interval", 15, lo=1),
+            "msg_delay": _n(data, "msg_delay", 5, lo=0)
         })
         config_service.save(config)
         return jsonify({"status": "success"})
@@ -457,7 +486,7 @@ def register_routes(app, socketio):
     @app.route("/api/add-account", methods=["POST"])
     @token_required
     def add_account():
-        data = request.get_json() or {}; phone = data.get("phone", "").strip()
+        data = request.get_json() or {}; phone = _s(data, "phone")
         p_clean = "".join(filter(str.isdigit, phone))
         config = config_service.load(); phones = [p.strip() for p in config.get("phones", "").split("\n") if p.strip()]
         if any("".join(filter(str.isdigit, p)) == p_clean for p in phones): return jsonify({"status": "error", "message": "Exists"}), 409
@@ -487,14 +516,14 @@ def register_routes(app, socketio):
     @app.route("/api/logout-account", methods=["POST"])
     @token_required
     def logout_account():
-        phone = (request.get_json() or {}).get("phone", "").strip()
+        phone = _s(request.get_json() or {}, "phone")
         run_async(_cleanup_reauth(phone))
         return jsonify({"status": "success"})
 
     @app.route("/api/delete-account", methods=["POST"])
     @token_required
     def delete_account():
-        phone = (request.get_json() or {}).get("phone", "").strip()
+        phone = _s(request.get_json() or {}, "phone")
         p_clean = "".join(filter(str.isdigit, phone))
         run_async(_cleanup_reauth(phone)); config = config_service.load()
         phones = [p.strip() for p in config.get("phones", "").split("\n") if p.strip()]
@@ -507,7 +536,7 @@ def register_routes(app, socketio):
     @app.route("/api/account-targets", methods=["GET"])
     @token_required
     def get_targets():
-        phone = request.args.get("phone", "").strip(); p_clean = "".join(filter(str.isdigit, phone))
+        phone = _s(request.args, "phone"); p_clean = "".join(filter(str.isdigit, phone))
         config = config_service.load(); targets = config.get("account_settings", {}).get(p_clean, {}).get("targets", [])
         return jsonify({"status": "success", "targets": "\n".join(targets)})
 
@@ -555,7 +584,7 @@ def register_routes(app, socketio):
     @token_required
     def send_otp():
         data = request.get_json() or {}
-        phone = data.get("phone"); api_id = data.get("api_id", "").strip(); api_hash = data.get("api_hash", "").strip()
+        phone = data.get("phone"); api_id = _s(data, "api_id"); api_hash = _s(data, "api_hash")
         p_clean = "".join(filter(str.isdigit, str(phone)))
         # Disconnect any previous abandoned auth client for this phone
         old_client = _AUTH_CLIENTS.pop(p_clean, None)
@@ -583,7 +612,7 @@ def register_routes(app, socketio):
     @token_required
     def sign_in_otp():
         data = request.get_json() or {}
-        phone = data.get("phone"); p_clean = "".join(filter(str.isdigit, str(phone))); code = data.get("code", "").strip()
+        phone = data.get("phone"); p_clean = "".join(filter(str.isdigit, str(phone))); code = _s(data, "code")
         client = _AUTH_CLIENTS.get(p_clean)
         if not client: return jsonify({"status": "error", "message": "Auth session expired"}), 400
         async def _logic():
@@ -694,18 +723,18 @@ def register_routes(app, socketio):
     @token_required
     def groups_add():
         data = request.get_json() or {}
-        ref = (data.get("ref") or "").strip()
+        ref = _s(data, "ref")
         if not ref:
             return jsonify({"status": "error", "message": "Group link or @username required"}), 400
         try:
-            return jsonify(run_async(group_monitor.add_group(ref, data.get("account_phone", ""))))
+            return jsonify(run_async(group_monitor.add_group(ref, _s(data, "account_phone"))))
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
     @app.route("/api/groups/remove", methods=["POST"])
     @token_required
     def groups_remove():
-        chat_key = (request.get_json() or {}).get("chat_key", "")
+        chat_key = _s(request.get_json() or {}, "chat_key")
         try:
             run_async(group_monitor.remove_group(chat_key))
             return jsonify({"status": "success"})
@@ -717,7 +746,7 @@ def register_routes(app, socketio):
     def groups_toggle():
         data = request.get_json() or {}
         try:
-            run_async(group_monitor.set_active(data.get("chat_key", ""), bool(data.get("active"))))
+            run_async(group_monitor.set_active(_s(data, "chat_key"), bool(data.get("active"))))
             return jsonify({"status": "success"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
@@ -726,7 +755,7 @@ def register_routes(app, socketio):
     @token_required
     def groups_refresh():
         """Kick off a roster sync. Fire-and-forget — a big group can outlast run_async's timeout."""
-        chat_key = (request.get_json() or {}).get("chat_key", "")
+        chat_key = _s(request.get_json() or {}, "chat_key")
         coro = group_monitor.sync_group(chat_key) if chat_key else group_monitor.sync_all()
         asyncio.run_coroutine_threadsafe(coro, _BOT_LOOP)
         return jsonify({"status": "success", "message": "Sync started — results appear as they land."})
@@ -850,7 +879,7 @@ def register_routes(app, socketio):
     @app.route("/api/bot/recipients/add", methods=["POST"])
     @token_required
     def bot_recipients_add():
-        raw = (request.get_json() or {}).get("raw", "")
+        raw = (request.get_json() or {}).get("raw") or ""
         if not str(raw).strip():
             return jsonify({"status": "error", "message": "Paste at least one username or user ID"}), 400
         return jsonify(message_bot.add_bulk(raw))
@@ -858,7 +887,7 @@ def register_routes(app, socketio):
     @app.route("/api/bot/recipients/delete", methods=["POST"])
     @token_required
     def bot_recipients_delete():
-        ids = (request.get_json() or {}).get("ids", [])
+        ids = (request.get_json() or {}).get("ids") or []
         try:
             ids = [int(i) for i in ids]
         except Exception:
@@ -880,12 +909,12 @@ def register_routes(app, socketio):
     def bot_recipients_import():
         """Copy people the Group Monitor already recorded into the sending pool."""
         d = request.get_json() or {}
-        view = d.get("view", "present")
+        view = _s(d, "view", "present") or "present"
         if view not in ("present", "joined", "left"):
             return jsonify({"status": "error", "message": "Unknown view"}), 400
         try:
             return jsonify(message_bot.import_from_groups(
-                chat_key=(d.get("chat_key") or "").strip(),
+                chat_key=_s(d, "chat_key"),
                 view=view,
                 skip_bots=bool(d.get("skip_bots", True)),
             ))
@@ -952,7 +981,7 @@ def register_routes(app, socketio):
     def bot_send():
         d = request.get_json() or {}
         try:
-            ids = [int(i) for i in d.get("recipient_ids", [])]
+            ids = [int(i) for i in (d.get("recipient_ids") or [])]
         except Exception:
             return jsonify({"status": "error", "message": "Bad recipient ids"}), 400
 
@@ -966,14 +995,14 @@ def register_routes(app, socketio):
         sender = "account" if d.get("sender") == "account" else "bot"
         return jsonify(message_bot.start_campaign(
             sender=sender,
-            account_phone=(d.get("account_phone") or "").strip(),
+            account_phone=_s(d, "account_phone"),
             recipient_ids=ids,
-            text=d.get("text", ""),
-            file_path=d.get("file_path", ""),
-            link=d.get("link", "").strip(),
-            link_label=d.get("link_label", "").strip(),
+            text=_s(d, "text"),
+            file_path=_s(d, "file_path"),
+            link=_s(d, "link"),
+            link_label=_s(d, "link_label"),
             link_as_button=bool(d.get("link_as_button", True)),
-            delay=max(0.0, float(d.get("delay", 1.5))),
+            delay=_n(d, "delay", 1.5, float, lo=0.0),
             on_progress=_progress,
         ))
 

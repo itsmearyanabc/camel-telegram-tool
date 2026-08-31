@@ -60,6 +60,7 @@ class BotWorker:
         self._run_dirty = False
         # One dialog sweep per worker is enough to fill the peer cache.
         self._peers_warmed = False
+        self._prime_task: Optional[asyncio.Task] = None
 
         # Idempotency & Coordination
         self.last_processed_msg = None
@@ -76,8 +77,10 @@ class BotWorker:
         await self._setup_monitor()
 
         # Everything slow happens off to the side, so the Start button returns
-        # immediately instead of racing run_async's 30s budget.
-        asyncio.ensure_future(self._prime())
+        # immediately instead of racing run_async's 30s budget. Keep the handle:
+        # an untracked task would sail past a Stop pressed a second later and
+        # queue a campaign for a worker the user just turned off.
+        self._prime_task = asyncio.ensure_future(self._prime())
 
         logger.info(f"[{self.phone}] Worker started successfully.")
         return True, "Started"
@@ -108,9 +111,13 @@ class BotWorker:
         try:
             if not self._peers_warmed:
                 await self._warm_peer_cache()
+            if not self.is_running:
+                return                      # stopped while we were warming
 
             if not self.current_msg_id:
                 await self._adopt_latest_source_message()
+            if not self.is_running:
+                return                      # stopped while we were reading history
 
             if self.current_msg_id:
                 logger.info(f"[{self.phone}] Priming dispatch for message "
@@ -153,9 +160,38 @@ class BotWorker:
 
     async def stop(self):
         self.is_running = False
+
+        # Priming runs detached, so without this a Stop pressed just after Start
+        # leaves it to finish and queue a dispatch anyway.
+        if self._prime_task and not self._prime_task.done():
+            self._prime_task.cancel()
+            try:
+                await self._prime_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._prime_task = None
+
         await self.worker_manager.stop_loop()
         await self.scheduler.stop_loop()
         await self._remove_monitor()
+
+        # Drain what was still queued. Leaving it would mean the NEXT start
+        # silently forwards the message this run was stopped part-way through.
+        dropped = 0
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+                dropped += 1
+            except Exception:
+                break
+        if dropped:
+            logger.info(f"[{self.phone}] Cleared {dropped} pending target(s) on stop.")
+            for t, r in self.target_results.items():
+                if r.get("status") in ("queued", "sending"):
+                    r["status"] = "idle"
+                    r["error"] = ""
+
         await self.progress.set_action("Stopped")
         logger.info(f"[{self.phone}] Worker stopped.")
 
@@ -549,6 +585,16 @@ class BotWorker:
                     await asyncio.sleep(1)
                 
                 target = await self.queue.get()
+
+                # The pool is editable mid-run, and this item was queued before
+                # the edit. Honour the removal rather than sending anyway.
+                if target not in self.targets:
+                    logger.info(f"[{self.phone}] Skipping {target} — removed from the pool.")
+                    self.target_results.pop(target, None)
+                    await self.progress.drop()
+                    self.queue.task_done()
+                    continue
+
                 self._mark_target(target, "sending")
 
                 async with self.global_semaphore:
@@ -639,7 +685,11 @@ class BotWorker:
         return {
             "phone": self.phone, "clean_phone": self.clean_phone,
             "is_running": self.is_running,
-            "state": "sending" if stats["progress"] < 100 and stats["total"] > 0 else "idle",
+            # "cooldown" is a state the dashboard already styles but nothing
+            # ever sent, so a FloodWait looked identical to normal sending.
+            "state": ("cooldown" if cd_rem > 0
+                      else "sending" if stats["progress"] < 100 and stats["total"] > 0
+                      else "idle"),
             "sent": stats["sent"], "errors": stats["failed"], "total": stats["total"],
             "last_action": stats["last_action"], "progress": stats["progress"],
             "targets_count": len(self.targets), "source_channel": self.source_channel,

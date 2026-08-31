@@ -31,6 +31,17 @@ class ProgressTracker:
                 self.failed += 1
             self.last_action = f"❌ Failed {target}: {error}"
 
+    async def drop(self):
+        """
+        A queued target vanished before its turn — shrink the batch.
+
+        Without this the progress bar can never reach 100%, so the card stays
+        stuck on "sending" forever after a target is removed mid-run.
+        """
+        async with self._lock:
+            if self.total > 0:
+                self.total -= 1
+
     async def set_action(self, action: str):
         async with self._lock:
             self.last_action = action
