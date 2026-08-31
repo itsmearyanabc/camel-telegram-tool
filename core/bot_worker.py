@@ -58,6 +58,8 @@ class BotWorker:
         # says WHICH, and why, so a dead channel can be found and removed.
         self.target_results: Dict[str, dict] = {}
         self._run_dirty = False
+        # One dialog sweep per worker is enough to fill the peer cache.
+        self._peers_warmed = False
 
         # Idempotency & Coordination
         self.last_processed_msg = None
@@ -171,6 +173,60 @@ class BotWorker:
                 pass
         return refs
 
+    @staticmethod
+    def _known_username_for(chat_id):
+        """
+        Ask the Group Monitor whether it knows a username for this chat id.
+
+        The two features watch the same chats, and a username is worth far more
+        than an id: Telegram resolves it server-side, no access_hash needed.
+        """
+        try:
+            from core.services.group_store import group_store
+            for g in group_store.list_groups():
+                if str(g.get("chat_id")) == str(chat_id) and g.get("username"):
+                    return g["username"]
+        except Exception:
+            pass
+        return None
+
+    async def _warm_peer_cache(self):
+        """
+        Fill the session's peer cache by sweeping the account's dialog list.
+
+        A numeric channel id resolves only when its access_hash is known.
+        Telegram will not supply that from the id alone — Pyrogram falls back to
+        channels.GetChannels with access_hash=0 and gets back
+        "[400 CHANNEL_INVALID]" — so the hash has to come from somewhere the
+        account legitimately sees the chat. Its own dialog list is exactly that,
+        and one sweep caches every chat it belongs to.
+
+        Needed because the cache lives inside the .session file: a restore
+        (every boot on a RAM-backed install) brings back a file whose cache
+        predates these chats.
+        """
+        try:
+            n = 0
+            async for _ in self.client.get_dialogs():
+                n += 1
+            logger.info(f"[{self.phone}] Peer cache warmed from {n} dialog(s).")
+            self._peers_warmed = True
+            return n
+        except Exception as e:
+            logger.warning(f"[{self.phone}] Could not warm the peer cache: {e}")
+            self._peers_warmed = True     # do not retry in a tight loop
+            return 0
+
+    async def _try_refs(self, refs):
+        """First ref that resolves wins. Returns (chat, error)."""
+        last = ""
+        for ref in refs:
+            try:
+                return await self.client.get_chat(ref), ""
+            except Exception as e:
+                last = str(e)
+        return None, last
+
     async def _ensure_source_peer(self):
         """
         Make the SOURCE chat resolvable before forwarding anything.
@@ -191,13 +247,23 @@ class BotWorker:
         if not refs:
             return False, "No source channel configured"
 
-        last = ""
-        for ref in refs:
-            try:
-                chat = await self.client.get_chat(ref)
-            except Exception as e:
-                last = str(e)
-                continue
+        # A username the Group Monitor already knows beats any numeric id.
+        for candidate in (self.current_from_chat, refs[0] if refs else None):
+            uname = self._known_username_for(candidate) if candidate else None
+            if uname and uname not in refs:
+                refs.insert(0, uname)
+                break
+
+        chat, last = await self._try_refs(refs)
+
+        # Still nothing: the cache is cold. Sweep dialogs once, then retry —
+        # this is what recovers a numeric-only source after a session restore.
+        if chat is None and not self._peers_warmed:
+            logger.info(f"[{self.phone}] Source {refs} unresolved; warming the peer cache.")
+            if await self._warm_peer_cache():
+                chat, last = await self._try_refs(refs)
+
+        if chat is not None:
             if self.current_from_chat and chat.id != self.current_from_chat:
                 # Telegram is the authority; a supergroup migration moves the id.
                 logger.info(f"[{self.phone}] Source chat id changed "
@@ -207,6 +273,7 @@ class BotWorker:
             elif not self.current_from_chat:
                 self.current_from_chat = chat.id
             return True, ""
+
         return False, last or "Could not resolve the source channel"
 
     async def _setup_monitor(self):
