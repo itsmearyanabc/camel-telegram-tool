@@ -27,7 +27,7 @@ Run `preflight.sh` first — it is read-only and reports exactly what is already
 on the box and what would conflict:
 
 ```bash
-sudo bash preflight.sh telegrambot.yourdomain.com
+sudo bash preflight.sh bot.yourdomain.com telegram-tool
 ```
 
 ---
@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/itsmearyanabc/camel-telegram-tool/m
 ```
 
 It installs Python, nginx, certbot and the firewall; creates an unprivileged
-`armedias` user; clones the repo to `/opt/armedias`; builds a virtualenv;
+`telegramtool` service user; clones the repo to `/opt/telegram-tool`; builds a virtualenv;
 installs the systemd service; configures nginx; and requests a Let's Encrypt
 certificate. Re-running it is safe — it never overwrites `.env`, `sessions/`
 or `data/`.
@@ -77,14 +77,14 @@ The installer generates a random `SECRET_KEY` but deliberately leaves the admin
 password as a placeholder:
 
 ```bash
-sudo nano /opt/armedias/.env
+sudo nano /opt/telegram-tool/.env
 ```
 
 Set `ADMIN_PASS` to something strong. If you want off-box backups too, fill in
 `SUPABASE_URL` and `SUPABASE_KEY` while you're in there. Then:
 
 ```bash
-sudo systemctl restart armedias
+sudo systemctl restart telegram-tool
 ```
 
 The password is hashed once at startup, so the restart is required.
@@ -98,11 +98,11 @@ The password is hashed once at startup, so the restart is required.
 ## Day-to-day
 
 ```bash
-sudo bash /opt/armedias/deploy/update.sh   # pull latest code and restart
-sudo systemctl restart armedias            # restart
-sudo systemctl status armedias             # is it running
-journalctl -u armedias -f                  # live logs
-tail -f /opt/armedias/logs/bot.log         # app's own log
+sudo bash /opt/telegram-tool/deploy/update.sh   # pull latest code and restart
+sudo systemctl restart telegram-tool            # restart
+sudo systemctl status telegram-tool             # is it running
+journalctl -u telegram-tool -f                  # live logs
+tail -f /opt/telegram-tool/logs/bot.log         # app's own log
 ```
 
 ---
@@ -111,12 +111,12 @@ tail -f /opt/armedias/logs/bot.log         # app's own log
 
 | Path | Contents | Survives updates |
 |---|---|---|
-| `/opt/armedias/.env` | admin password, secret key, Supabase keys | yes |
-| `/opt/armedias/sessions/` | Telegram account logins | yes |
-| `/opt/armedias/config.json` | accounts, targets, intervals | yes |
-| `/opt/armedias/data/group_monitor.db` | monitored groups and members | yes |
-| `/opt/armedias/data/message_bot.db` | bot token and user pool | yes |
-| `/opt/armedias/logs/` | rotating application log | yes |
+| `/opt/telegram-tool/.env` | admin password, secret key, Supabase keys | yes |
+| `/opt/telegram-tool/sessions/` | Telegram account logins | yes |
+| `/opt/telegram-tool/config.json` | accounts, targets, intervals | yes |
+| `/opt/telegram-tool/data/group_monitor.db` | monitored groups and members | yes |
+| `/opt/telegram-tool/data/message_bot.db` | bot token and user pool | yes |
+| `/opt/telegram-tool/logs/` | rotating application log | yes |
 
 `update.sh` does `git reset --hard`, which only touches tracked files. Everything
 above is gitignored, so none of it is at risk.
@@ -144,13 +144,13 @@ give the VPS more RAM instead.
 
 **Service won't start**
 ```bash
-journalctl -u armedias -n 50 --no-pager
+journalctl -u telegram-tool -n 50 --no-pager
 ```
 Usually a missing value in `.env` or a dependency that failed to build.
 
 **502 Bad Gateway** — nginx is up but the app isn't:
 ```bash
-sudo systemctl status armedias
+sudo systemctl status telegram-tool
 ```
 
 **Certificate failed** — DNS wasn't pointing here yet. Once `nslookup` resolves
@@ -162,13 +162,13 @@ sudo certbot --nginx -d bot.yourdomain.com
 **Dashboard loads but never updates** — Socket.IO isn't getting through the
 proxy. Confirm the `/socket.io/` block is present:
 ```bash
-sudo nginx -t && grep -A3 'socket.io' /etc/nginx/sites-available/armedias
+sudo nginx -t && grep -A3 'socket.io' /etc/nginx/sites-available/telegram-tool
 ```
 
 **Uploads rejected around 1 MB** — `client_max_body_size` didn't apply. It must
 be at least 60M in the server block; reload nginx after fixing.
 
-**Telegram logins vanish after redeploy** — you wiped `/opt/armedias`. Restore
+**Telegram logins vanish after redeploy** — you wiped `/opt/telegram-tool`. Restore
 from Supabase by setting the keys in `.env` and restarting; the app pulls
 sessions and both databases back on boot.
 

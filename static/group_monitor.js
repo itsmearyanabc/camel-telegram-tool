@@ -7,7 +7,7 @@
 
 let currentGroups = [];
 let gmAccounts = [];
-let gmView = { chat_key: null, view: 'present', title: '' };
+let gmView = { chat_key: null, view: 'present', title: '', all: false };
 let gmSearchTimer = null;
 
 /** Escape untrusted text — group member names come from arbitrary Telegram users. */
@@ -40,7 +40,7 @@ function updateGroupStats(t) {
         gmTotal: t.groups || 0,
         gmPresent: t.present || 0,
         gmJoined: t.joins || 0,
-        gmLeft: t.leaves || 0
+        gmLeft: t.left || 0
     };
     for (const [id, val] of Object.entries(map)) {
         const el = document.getElementById(id);
@@ -227,6 +227,7 @@ async function refreshAllGroups() {
 // ──────────────────────────────────────────────
 
 function openGroupData(chatKey, view) {
+    gmView.all = false;
     gmView.chat_key = chatKey;
     gmView.view = view || 'present';
     const g = currentGroups.find(x => x.chat_key === chatKey);
@@ -236,6 +237,26 @@ function openGroupData(chatKey, view) {
     document.getElementById('gm-data-sub').textContent = g
         ? (g.username ? '@' + g.username : 'ID ' + g.chat_id) + ' · watched by ' + gmAccountLabel(g.account_phone)
         : '';
+    openViewer();
+}
+
+/** Every monitored group merged into one list - opened from the summary tiles. */
+function openAllGroupsData(view) {
+    gmView.all = true;
+    gmView.chat_key = '';
+    gmView.view = view || 'present';
+    gmView.title = 'All Groups';
+
+    document.getElementById('gm-data-title').textContent = 'All Groups';
+    document.getElementById('gm-data-sub').textContent =
+        currentGroups.length + ' monitored group' + (currentGroups.length === 1 ? '' : 's') +
+        ' · combined into one list';
+    openViewer();
+}
+
+function openViewer() {
+    // The group column only earns its width when rows can come from anywhere.
+    document.getElementById('gm-th-group').style.display = gmView.all ? '' : 'none';
     document.getElementById('gm-search').value = '';
     showModal('group-data-modal');
     switchGroupView(gmView.view);
@@ -248,7 +269,11 @@ function switchGroupView(view) {
     });
     document.getElementById('gm-th-time').textContent =
         view === 'left' ? 'Left At' : (view === 'joined' ? 'Joined At' : 'First Seen');
-    const notes = {
+    const notes = gmView.all ? {
+        present: 'Everyone currently in any monitored group, from the most recent roster sync.',
+        joined: 'Joins detected across all groups since monitoring started. The pre-existing rosters are not counted here — see "In Group".',
+        left: 'People previously seen in a monitored group who are no longer in it.'
+    } : {
         present: 'Everyone currently in the group, from the most recent roster sync.',
         joined: 'Joins detected since monitoring started. The pre-existing roster is not counted here — see "In Group".',
         left: 'Members previously seen in the group who are no longer in it.'
@@ -259,16 +284,17 @@ function switchGroupView(view) {
 
 async function reloadGroupView() {
     const tbody = document.getElementById('gm-rows');
-    tbody.innerHTML = '<tr><td colspan="5" class="gm-empty-row">Loading...</td></tr>';
+    const cols = gmView.all ? 6 : 5;
+    const span = (msg) => '<tr><td colspan="' + cols + '" class="gm-empty-row">' + msg + '</td></tr>';
+    tbody.innerHTML = span('Loading...');
 
     const search = document.getElementById('gm-search').value.trim();
-    const url = '/api/groups/data?chat_key=' + encodeURIComponent(gmView.chat_key) +
+    const url = '/api/groups/data?chat_key=' + encodeURIComponent(gmView.chat_key || '') +
                 '&view=' + gmView.view + '&search=' + encodeURIComponent(search);
     const data = await apiCall(url);
 
     if (!data || data.status !== 'success') {
-        tbody.innerHTML = '<tr><td colspan="5" class="gm-empty-row">' +
-            esc((data && data.message) || 'Failed to load') + '</td></tr>';
+        tbody.innerHTML = span(esc((data && data.message) || 'Failed to load'));
         return;
     }
 
@@ -279,8 +305,7 @@ async function reloadGroupView() {
 
     const rows = data.rows || [];
     if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="gm-empty-row">' +
-            (search ? 'No matches.' : 'Nothing recorded yet.') + '</td></tr>';
+        tbody.innerHTML = span(search ? 'No matches.' : 'Nothing recorded yet.');
         return;
     }
 
@@ -290,14 +315,29 @@ async function reloadGroupView() {
             : '<span class="gm-none">hidden</span>';
         const name = (r.name ? esc(r.name) : '<span class="gm-none">—</span>') +
                      (r.is_bot ? '<span class="gm-pill">BOT</span>' : '');
+        const groupCell = gmView.all
+            ? '<td class="gm-group">' + esc(r.group || '—') + '</td>'
+            : '';
         return '<tr>' +
             '<td style="color:var(--text3)">' + (i + 1) + '</td>' +
+            groupCell +
             '<td>' + uname + '</td>' +
             '<td>' + name + '</td>' +
             '<td class="gm-id">' + esc(r.user_id) + '</td>' +
             '<td style="color:var(--text2);white-space:nowrap">' + formatWhen(r.ts) + '</td>' +
         '</tr>';
     }).join('');
+
+    // In the combined list a person in three groups is three rows, so the row
+    // count is not a headcount. State both numbers instead of leaving it ambiguous.
+    if (gmView.all && data.unique_users !== undefined) {
+        const note = document.getElementById('gm-data-note');
+        note.textContent = rows.length + ' row' + (rows.length === 1 ? '' : 's') +
+            ' across ' + (g.group_count || 0) + ' group' + (g.group_count === 1 ? '' : 's') +
+            ' · ' + data.unique_users + ' unique ' +
+            (data.unique_users === 1 ? 'person' : 'people') +
+            ' (someone in several groups appears once per group). ' + note.textContent;
+    }
 }
 
 function debouncedGroupSearch() {
@@ -307,7 +347,7 @@ function debouncedGroupSearch() {
 
 async function exportGroupView() {
     const token = localStorage.getItem('token');
-    const url = '/api/groups/export?chat_key=' + encodeURIComponent(gmView.chat_key) + '&view=' + gmView.view;
+    const url = '/api/groups/export?chat_key=' + encodeURIComponent(gmView.chat_key || '') + '&view=' + gmView.view;
     try {
         const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
         if (!res.ok) { toast('Export failed', 'err'); return; }
@@ -322,4 +362,82 @@ async function exportGroupView() {
     } catch (e) {
         toast('Export failed', 'err');
     }
+}
+
+// ──────────────────────────────────────────────
+// HAND-OFF TO THE MESSAGE BOT
+// ──────────────────────────────────────────────
+//
+// Two routes to the same place. "Copy" puts the rows on the clipboard in the
+// form the pool's paste box understands; "To Pool" skips the clipboard and
+// imports server-side. Both carry the username AND the numeric ID, because a
+// user account resolves a username anywhere but an ID only for people it has
+// already seen.
+
+/** One person per line as `@username:id`, or whichever half exists. */
+function gmRowsAsTokens(rows) {
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+        const uname = (r.username || '').trim();
+        const uid = r.user_id;
+        if (!uname && !uid) continue;
+        const key = uid || ('@' + uname.toLowerCase());
+        if (seen.has(key)) continue;      // same person in several groups
+        seen.add(key);
+        if (uname && uid) out.push('@' + uname + ':' + uid);
+        else if (uname) out.push('@' + uname);
+        else out.push(String(uid));
+    }
+    return out;
+}
+
+async function copyGroupView() {
+    const url = '/api/groups/data?chat_key=' + encodeURIComponent(gmView.chat_key || '') +
+                '&view=' + gmView.view +
+                '&search=' + encodeURIComponent(document.getElementById('gm-search').value.trim());
+    const data = await apiCall(url);
+    if (!data || data.status !== 'success') return toast('Could not read the list', 'err');
+
+    const tokens = gmRowsAsTokens(data.rows || []);
+    if (!tokens.length) return toast('Nothing to copy', 'err');
+    const text = tokens.join('\n');
+
+    let ok = false;
+    try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+    } catch (e) {
+        // clipboard API needs a secure context; fall back to the old trick.
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+        ta.remove();
+    }
+    toast(ok ? tokens.length + ' copied — paste into the Message Bot "Add Users" box'
+             : 'Could not reach the clipboard', ok ? 'ok' : 'err');
+}
+
+/** Import the rows currently in view straight into the Message Bot pool. */
+async function sendGroupViewToPool() {
+    const view = gmView.view;
+    const label = gmView.all ? 'all monitored groups' : ('"' + gmView.title + '"');
+    if (!confirm('Add everyone in this ' + view + ' list from ' + label + ' to the Message Bot pool?')) return;
+
+    const d = await apiCall('/api/bot/recipients/import', {
+        method: 'POST',
+        body: JSON.stringify({ chat_key: gmView.chat_key || '', view: view, skip_bots: true })
+    });
+    if (d.status !== 'success') return toast(d.message || 'Import failed', 'err');
+
+    const parts = [];
+    if (d.added) parts.push(d.added + ' added');
+    if (d.updated) parts.push(d.updated + ' already in pool');
+    if (d.skipped) parts.push(d.skipped + ' skipped');
+    toast(parts.join(' · ') || 'Nothing new to import');
+    if (typeof loadBot === 'function') loadBot();
 }

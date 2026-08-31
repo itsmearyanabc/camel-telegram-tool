@@ -378,6 +378,57 @@ class GroupStore:
             finally:
                 conn.close()
 
+    # ─────────────────────────────────────
+    # CROSS-GROUP READS
+    # ─────────────────────────────────────
+    # The dashboard's summary tiles count every group at once, so clicking one
+    # has to open the same rows the tile counted. These mirror get_members /
+    # get_events exactly, minus the chat_key filter, plus the group title so a
+    # combined list can still say where each row came from.
+    #
+    # One person in three groups is three rows here, deliberately — that is what
+    # makes the row count match the tile. The caller reports the distinct-person
+    # count separately.
+
+    def get_members_all(self, status: str = "present",
+                        search: str = "", limit: int = 5000) -> List[Dict]:
+        order = "m.joined_at DESC" if status == "present" else "m.left_at DESC"
+        sql = ("SELECT m.*, g.title AS group_title, g.username AS group_username "
+               "FROM members m JOIN groups g ON g.chat_key = m.chat_key "
+               "WHERE m.status=?")
+        params = [status]
+        if search:
+            sql += " AND (IFNULL(m.username,'') LIKE ? OR IFNULL(m.first_name,'') LIKE ?"                    " OR IFNULL(m.last_name,'') LIKE ? OR CAST(m.user_id AS TEXT) LIKE ?"                    " OR IFNULL(g.title,'') LIKE ?)"
+            like = f"%{search}%"
+            params += [like, like, like, like, like]
+        sql += f" ORDER BY {order} LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            conn = self._conn()
+            try:
+                return [dict(r) for r in conn.execute(sql, params).fetchall()]
+            finally:
+                conn.close()
+
+    def get_events_all(self, event_type: str = "join",
+                       search: str = "", limit: int = 5000) -> List[Dict]:
+        sql = ("SELECT e.*, g.title AS group_title, g.username AS group_username "
+               "FROM events e JOIN groups g ON g.chat_key = e.chat_key "
+               "WHERE e.event_type=?")
+        params = [event_type]
+        if search:
+            sql += " AND (IFNULL(e.username,'') LIKE ? OR IFNULL(e.display_name,'') LIKE ?"                    " OR CAST(e.user_id AS TEXT) LIKE ? OR IFNULL(g.title,'') LIKE ?)"
+            like = f"%{search}%"
+            params += [like, like, like, like]
+        sql += " ORDER BY e.ts DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            conn = self._conn()
+            try:
+                return [dict(r) for r in conn.execute(sql, params).fetchall()]
+            finally:
+                conn.close()
+
     def checkpoint(self) -> None:
         """Fold the WAL back into the main .db file so a file-level backup is complete."""
         with self._lock:

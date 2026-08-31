@@ -37,10 +37,16 @@ class ConfigService:
             if os.path.exists(temp_path): os.remove(temp_path)
             logger.error(f"Atomic save failure: {e}")
             return
-        # Sync to Supabase (non-blocking best-effort)
+        # Queue the cloud copy instead of uploading inline.
+        #
+        # backup_config() is a synchronous HTTP POST with a 30s timeout. Several
+        # callers run on _BOT_LOOP — the single event loop every Pyrogram client
+        # shares — so an inline upload stalled all forwarding for the duration.
+        # Debouncing also collapses a burst of edits into one upload. Pending
+        # backups are flushed on shutdown by app.py.
         try:
             from core.services.persistence import persistence
-            persistence.backup_config()
+            persistence.schedule_backup("config")
         except Exception as e:
             logger.warning(f"☁️ Config cloud sync skipped: {e}")
 

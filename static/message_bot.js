@@ -10,6 +10,8 @@ let mbSelected = new Set();
 let mbAttachment = null;          // { path, name, size_mb, kind }
 let mbSearchTimer = null;
 let mbBot = { connected: false };
+let mbSenders = [];               // [{ id, kind, label, note }]
+let mbGroups = [];                // monitored groups, for the import picker
 
 // ──────────────────────────────────────────────
 // STATE
@@ -18,6 +20,7 @@ let mbBot = { connected: false };
 socket.on('bot_update', (d) => {
     if (!document.getElementById('mb-pool-rows')) return;
     mbBot = d.bot || {};
+    if (d.senders) { mbSenders = d.senders; renderSenders(); }
     renderBotBar();
     updateBotStats(d.totals || {});
     applySendState(d.send_state || {});
@@ -31,6 +34,9 @@ async function loadBot() {
     if (!d || d.status !== 'success') return;
     mbBot = d.bot || {};
     mbRecipients = d.recipients || [];
+    mbSenders = d.senders || [];
+    mbGroups = d.groups || [];
+    renderSenders();
     renderBotBar();
     renderPool();
     updateBotStats(d.totals || {});
@@ -148,12 +154,27 @@ function renderPool() {
 }
 
 function updatePoolNote() {
-    const pending = mbRecipients.filter(r => r.status === 'pending').length;
     const note = document.getElementById('mb-pool-note');
     if (!note) return;
+    const pending = mbRecipients.filter(r => r.status === 'pending').length;
+    const s = currentSender();
+
+    // The status column describes the BOT path. An account ignores it entirely,
+    // so saying "cannot be messaged" while an account is selected would be wrong.
+    if (s && s.kind === 'account') {
+        const noId = mbRecipients.filter(r => !r.user_id && !r.username).length;
+        note.textContent = 'Sending as ' + s.label + ' — the PENDING and BLOCKED badges apply to ' +
+            'bot sending only and are ignored here. ' +
+            (noId ? noId + ' row(s) have neither a username nor an ID and will fail. '
+                  : 'Everyone here has a username or an ID to send to. ') +
+            'A numeric ID resolves only if this account has seen the person before — ' +
+            'imported group members qualify.';
+        return;
+    }
     note.textContent = pending
         ? pending + ' user(s) cannot be messaged yet. Telegram does not let a bot open a chat first — ' +
-          'they must press Start on your bot once. They flip to READY automatically the moment they do.'
+          'they must press Start on your bot once. They flip to READY automatically the moment they do. ' +
+          'Switch "Send Using" to a logged-in account to reach them without that.'
         : 'Users stay in this pool permanently until you select and delete them.';
 }
 
@@ -219,6 +240,134 @@ async function deleteSelected() {
 function debouncedPoolSearch() {
     clearTimeout(mbSearchTimer);
     mbSearchTimer = setTimeout(loadBot, 300);
+}
+
+
+// ──────────────────────────────────────────────
+// SENDER — bot vs a logged-in user account
+// ──────────────────────────────────────────────
+//
+// A bot cannot open a chat with someone who has not pressed Start; a user
+// account can message anyone. That is the whole reason this choice exists.
+
+function currentSender() {
+    const sel = document.getElementById('mb-sender');
+    const id = sel ? sel.value : '';
+    return mbSenders.find(x => x.id === id) || null;
+}
+
+function renderSenders() {
+    const sel = document.getElementById('mb-sender');
+    if (!sel) return;
+
+    if (!mbSenders.length) {
+        sel.innerHTML = '<option value="">No bot connected and no account logged in</option>';
+        document.getElementById('mb-sender-note').textContent =
+            'Connect a bot above, or log in a Telegram account on the Dashboard tab.';
+        return;
+    }
+
+    // Prefer whatever was picked last; otherwise a user account, since that is
+    // the path that actually reaches people who never started the bot.
+    const saved = localStorage.getItem('mbSender');
+    let want = mbSenders.some(x => x.id === saved) ? saved : null;
+    if (!want) {
+        const acct = mbSenders.find(x => x.kind === 'account');
+        want = acct ? acct.id : mbSenders[0].id;
+    }
+
+    const html = mbSenders.map(x =>
+        '<option value="' + esc(x.id) + '">' +
+        (x.kind === 'account' ? 'Account: ' : '') + esc(x.label) + '</option>'
+    ).join('');
+    if (sel.dataset.sig !== html) { sel.innerHTML = html; sel.dataset.sig = html; }
+    sel.value = want;
+    onSenderChange(true);
+}
+
+function onSenderChange(silent) {
+    const s = currentSender();
+    const note = document.getElementById('mb-sender-note');
+    const linkMode = document.getElementById('mb-link-mode');
+    const delay = document.getElementById('mb-delay');
+    if (!s) return;
+
+    localStorage.setItem('mbSender', s.id);
+
+    if (s.kind === 'account') {
+        note.innerHTML = '<strong>Reaches anyone</strong> — no need for them to message first. ' +
+            'Telegram treats bulk unsolicited DMs as spam, so keep the delay high and batches small; ' +
+            'a PeerFlood stops the run automatically.';
+        // Only bots can attach inline keyboards. Force the link inline.
+        if (linkMode) {
+            linkMode.value = 'text';
+            linkMode.disabled = true;
+            linkMode.title = 'Only bots can send tappable buttons — the link is appended as text';
+        }
+        // Bot pacing is far too fast for an account. Nudge it once, do not fight the user.
+        if (!silent && delay && parseFloat(delay.value) < 6) {
+            delay.value = 8;
+            updateDelayLabel();
+        }
+    } else {
+        note.textContent = 'Only reaches people who have pressed Start on the bot. ' +
+            'Anyone still PENDING will fail until they do.';
+        if (linkMode) { linkMode.disabled = false; linkMode.title = ''; }
+    }
+}
+
+// ──────────────────────────────────────────────
+// IMPORT FROM GROUP MONITOR
+// ──────────────────────────────────────────────
+
+function openImportFromGroups() {
+    if (!mbGroups.length) {
+        return toast('No groups are being monitored yet — add one on the Group Monitor tab', 'err');
+    }
+    const sel = document.getElementById('mb-import-group');
+    sel.innerHTML = '<option value="">All monitored groups</option>' +
+        mbGroups.map(g => '<option value="' + esc(g.chat_key) + '">' + esc(g.title) + '</option>').join('');
+    document.getElementById('mb-import-view').value = 'present';
+    document.getElementById('mb-import-skipbots').checked = true;
+    updateImportPreview();
+    showModal('import-groups-modal');
+}
+
+function updateImportPreview() {
+    const key = document.getElementById('mb-import-group').value;
+    const view = document.getElementById('mb-import-view').value;
+    const field = { present: 'present_count', joined: 'join_events', left: 'left_count' }[view];
+    const pool = key ? mbGroups.filter(g => g.chat_key === key) : mbGroups;
+    const n = pool.reduce((sum, g) => sum + (g[field] || 0), 0);
+    const label = { present: 'member', joined: 'join record', left: 'departed member' }[view];
+    document.getElementById('mb-import-preview').textContent =
+        n + ' ' + label + (n === 1 ? '' : 's') +
+        (key ? '' : ' across ' + mbGroups.length + ' group' + (mbGroups.length === 1 ? '' : 's')) +
+        '. People already in your pool are updated, not duplicated.';
+}
+
+async function runImportFromGroups() {
+    const btn = document.getElementById('mb-import-btn');
+    btn.disabled = true; btn.textContent = 'Importing...';
+    const d = await apiCall('/api/bot/recipients/import', {
+        method: 'POST',
+        body: JSON.stringify({
+            chat_key: document.getElementById('mb-import-group').value,
+            view: document.getElementById('mb-import-view').value,
+            skip_bots: document.getElementById('mb-import-skipbots').checked
+        })
+    });
+    btn.disabled = false; btn.textContent = 'Import to Pool';
+
+    if (d.status === 'success') {
+        const parts = [];
+        if (d.added) parts.push(d.added + ' added');
+        if (d.updated) parts.push(d.updated + ' already in pool');
+        if (d.skipped) parts.push(d.skipped + ' skipped');
+        toast(parts.join(' · ') || 'Nothing new to import');
+        closeModal();
+        loadBot();
+    } else toast(d.message || 'Import failed', 'err');
 }
 
 // ──────────────────────────────────────────────
@@ -291,7 +440,9 @@ function applySendState(s) {
 }
 
 async function sendBotMessage() {
-    if (!mbBot.connected) return toast('Connect a bot first', 'err');
+    const s = currentSender();
+    if (!s) return toast('Pick who to send as — connect a bot or log in an account', 'err');
+    if (s.kind === 'bot' && !mbBot.connected) return toast('Connect a bot first', 'err');
     if (!mbSelected.size) return toast('Select who to send to from the pool', 'err');
 
     const text = document.getElementById('mb-text').value.trim();
@@ -299,16 +450,27 @@ async function sendBotMessage() {
     if (!text && !mbAttachment && !link)
         return toast('Add a message, a file or a link first', 'err');
 
+    const delay = parseFloat(document.getElementById('mb-delay').value);
+    if (s.kind === 'account' && !confirm(
+            'Send to ' + mbSelected.size + ' people as ' + s.label + '?\n\n' +
+            'These are direct messages from your real Telegram account. Telegram limits ' +
+            'or bans accounts that send bulk unsolicited DMs — the risk is to this account, ' +
+            'not to a bot.\n\nDelay between messages: ' + delay + 's')) {
+        return;
+    }
+
     const d = await apiCall('/api/bot/send', {
         method: 'POST',
         body: JSON.stringify({
+            sender: s.kind,
+            account_phone: s.kind === 'account' ? s.id : '',
             recipient_ids: [...mbSelected],
             text: text,
             file_path: mbAttachment ? mbAttachment.path : '',
             link: link,
             link_label: document.getElementById('mb-link-label').value.trim(),
             link_as_button: document.getElementById('mb-link-mode').value === 'button',
-            delay: parseFloat(document.getElementById('mb-delay').value)
+            delay: delay
         })
     });
     toast(d.status === 'success' ? d.message : (d.message || 'Send failed'),

@@ -211,6 +211,27 @@ class BotStore:
                     _sync_cloud()
                     return "added"
 
+                # The person may already exist TWICE — once known only by
+                # username, once only by ID — because each paste knew half of
+                # them. Writing both identifiers onto one row would then break
+                # the other row's unique index, so absorb it first.
+                if user_id and username:
+                    dupes = conn.execute(
+                        "SELECT * FROM recipients WHERE (user_id=? OR username=?) AND id<>?",
+                        (user_id, username, row["id"]),
+                    ).fetchall()
+                    for d in dupes:
+                        conn.execute(
+                            "UPDATE recipients SET sent_count=sent_count+? WHERE id=?",
+                            (d["sent_count"] or 0, row["id"]),
+                        )
+                        # Keep the send history pointing at the surviving row.
+                        conn.execute(
+                            "UPDATE send_log SET recipient_id=? WHERE recipient_id=?",
+                            (row["id"], d["id"]),
+                        )
+                        conn.execute("DELETE FROM recipients WHERE id=?", (d["id"],))
+
                 # Merge: never blank out something we already know.
                 conn.execute(
                     "UPDATE recipients SET"

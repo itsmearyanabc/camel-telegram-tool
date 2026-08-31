@@ -53,6 +53,12 @@ class BotWorker:
         self.cooldown_until = 0
         self.last_dispatch_time = None
         
+        # Per-target delivery results for the current campaign, keyed by target.
+        # The aggregate counters in ProgressTracker say how many failed; this
+        # says WHICH, and why, so a dead channel can be found and removed.
+        self.target_results: Dict[str, dict] = {}
+        self._run_dirty = False
+
         # Idempotency & Coordination
         self.last_processed_msg = None
         self._handler = None
@@ -90,11 +96,36 @@ class BotWorker:
         self.loop_interval = max(1, int(interval))
         self.targets = [t.strip() for t in targets if t.strip()]
         self.msg_delay = max(0, int(delay))
-        
+
+        # Drop verdicts for targets that no longer exist, and give newly added
+        # ones a row so the pool shows them straight away.
+        self.target_results = {t: self.target_results[t]
+                               for t in self.targets if t in self.target_results}
+        for t in self.targets:
+            self.target_results.setdefault(
+                t, {"status": "idle", "error": "", "ts": None, "attempts": 0})
+
         await self._remove_monitor()
         await self._setup_monitor()
         if self.is_running:
             await self._start_scheduler()
+
+    async def update_targets(self, targets: List[str]):
+        """
+        Swap the target list only.
+
+        Deliberately does NOT touch the source handler or the re-forward
+        scheduler: the pool saves on every edit, and re-installing the monitor
+        (and restarting the interval countdown) on each checkbox would be both
+        wasteful and a way to keep pushing the next loop out of reach.
+        """
+        self.targets = [t.strip() for t in targets if t.strip()]
+        self.target_results = {t: self.target_results[t]
+                               for t in self.targets if t in self.target_results}
+        for t in self.targets:
+            self.target_results.setdefault(
+                t, {"status": "idle", "error": "", "ts": None, "attempts": 0})
+        logger.info(f"[{self.phone}] Target pool updated: {len(self.targets)} target(s).")
 
     async def _start_scheduler(self):
         await self.scheduler.start_loop(self._reforward_scheduler)
@@ -107,6 +138,20 @@ class BotWorker:
 
     async def _setup_monitor(self):
         if not self.client.is_connected: return
+
+        # A handler still hanging here means the previous detach failed. Try
+        # once more; if it still will not go, keep using it rather than
+        # registering a duplicate that would double every forward.
+        if self._handler:
+            try:
+                self.client.remove_handler(self._handler, group=1)
+                self._handler = None
+            except Exception as e:
+                logger.error(
+                    f"[{self.phone}] Source handler is stuck ({e}); reusing it "
+                    f"instead of attaching a second one.")
+                return
+
         resolved = self._get_resolved_source()
         if not resolved:
             logger.warning(f"[{self.phone}] No source channel configured - cannot monitor")
@@ -131,11 +176,63 @@ class BotWorker:
         logger.info(f"[{self.phone}] Monitoring source channel: {resolved} (waiting for new messages...)")
 
     async def _remove_monitor(self):
-        if self.client.is_connected and self._handler:
-            try: 
-                self.client.remove_handler(self._handler, group=1)
-                self._handler = None
-            except: pass
+        """
+        Detach the source-channel handler.
+
+        The reference is dropped only once Pyrogram confirms removal. Clearing
+        it on failure would strand a live handler with nothing pointing at it,
+        and the next _setup_monitor would stack a second one — after which every
+        new source message would dispatch twice.
+        """
+        if not self._handler:
+            return
+        if not self.client.is_connected:
+            # Nothing can fire while disconnected, and the handler dies with the
+            # session, so drop it and let a reconnect start clean.
+            self._handler = None
+            return
+        try:
+            self.client.remove_handler(self._handler, group=1)
+            self._handler = None
+        except Exception as e:
+            logger.warning(f"[{self.phone}] Could not detach source handler: {e}")
+
+    def _reset_target_results(self):
+        """Every target starts a campaign queued, with last run's verdict cleared."""
+        self.target_results = {
+            t: {"status": "queued", "error": "", "ts": None, "attempts": 0}
+            for t in self.targets
+        }
+
+    def _mark_target(self, target: str, status: str, error: str = ""):
+        row = self.target_results.setdefault(
+            target, {"status": "queued", "error": "", "ts": None, "attempts": 0})
+        row["status"] = status
+        row["error"] = error or ""
+        row["ts"] = time.time()
+        if status == "sending":
+            row["attempts"] = row.get("attempts", 0) + 1
+        self._run_dirty = True
+
+    def _persist_target_results(self):
+        """
+        Save the last verdict per target once a campaign drains.
+
+        Written at the end of a run rather than per target: each save rewrites
+        config.json and triggers a cloud sync, far too heavy to do once per
+        delivery.
+        """
+        try:
+            config = config_service.load()
+            settings = config.setdefault("account_settings", {}).setdefault(self.clean_phone, {})
+            settings["target_results"] = {
+                t: {"status": r.get("status"), "error": r.get("error", ""), "ts": r.get("ts")}
+                for t, r in self.target_results.items()
+                if t in self.targets
+            }
+            config_service.save(config)
+        except Exception as e:
+            logger.warning(f"[{self.phone}] Could not save target results: {e}")
 
     def _persist_state(self):
         """Save current campaign state to config for crash recovery."""
@@ -186,7 +283,8 @@ class BotWorker:
             
             # Reset progress tracking for new batch
             await self.progress.reset(len(self.targets))
-            
+            self._reset_target_results()
+
             # Queue up all targets
             for target in self.targets:
                 await self.queue.put(target)
@@ -224,15 +322,18 @@ class BotWorker:
                     await asyncio.sleep(1)
                 
                 target = await self.queue.get()
-                
+                self._mark_target(target, "sending")
+
                 async with self.global_semaphore:
                     success, err = await self._send_msg(target)
-                
+
                 if success:
                     self.last_dispatch_time = time.time()
+                    self._mark_target(target, "sent")
                     await self.progress.mark_success(target)
                 else:
                     logger.error(f"[{self.phone}] Delivery to {target} failed: {err}")
+                    self._mark_target(target, "failed", err)
                     await self.progress.mark_failure(target, err)
                 
                 # Bug Fix 2: Apply delay AFTER EACH MESSAGE
@@ -247,6 +348,10 @@ class BotWorker:
                 
                 if self.queue.empty():
                     await self.progress.set_action("Idle (Waiting for new source msg or interval)")
+                    # Campaign drained — write the verdicts once, not per target.
+                    if self._run_dirty:
+                        self._run_dirty = False
+                        self._persist_target_results()
                     
             except asyncio.CancelledError: break
             except Exception as e:
@@ -275,6 +380,15 @@ class BotWorker:
                 return False, f"FloodWait ({e.value}s)"
             except (PeerFlood, UserPrivacyRestricted, ChatWriteForbidden, UserBannedInChannel) as e:
                 return False, type(e).__name__
+            except asyncio.TimeoutError:
+                # wait_for cancelled us locally, but Telegram may well have
+                # accepted the forward already. Retrying would post the same
+                # message to the group a second time, which is exactly what
+                # gets a channel reported — so report it and move on.
+                logger.warning(
+                    f"[{self.phone}] Forward to {target} timed out after 15s; "
+                    f"not retrying (it may still have been delivered).")
+                return False, "Timed out (not retried — may have sent)"
             except Exception as e:
                 err_str = str(e)
                 if "MESSAGE_ID_INVALID" in err_str or "MessageIdInvalid" in err_str:
@@ -298,5 +412,14 @@ class BotWorker:
             "targets_count": len(self.targets), "source_channel": self.source_channel,
             "loop_interval": self.loop_interval, "is_loop_active": self.is_running,
             "cooldown_remaining": cd_rem, "msg_delay": self.msg_delay,
-            "last_dispatch_time": getattr(self, "last_dispatch_time", None)
+            "last_dispatch_time": getattr(self, "last_dispatch_time", None),
+            "targets": list(self.targets),
+            # Ordered to match the target list so the pool table is stable
+            # between refreshes instead of reshuffling under the cursor.
+            "target_results": [
+                dict(self.target_results.get(
+                    t, {"status": "idle", "error": "", "ts": None, "attempts": 0}),
+                    target=t)
+                for t in self.targets
+            ],
         }

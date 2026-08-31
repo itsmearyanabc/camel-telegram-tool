@@ -109,6 +109,18 @@ def token_required(f):
 # ──────────────────────────────────────────────
 # CORE LOGIC HELPER
 # ──────────────────────────────────────────────
+def _saved_target_results(acct_settings):
+    """Last known per-target verdict from config, in the worker's list shape."""
+    saved = acct_settings.get("target_results") or {}
+    out = []
+    for t in acct_settings.get("targets", []):
+        r = saved.get(t) if isinstance(saved, dict) else None
+        r = r if isinstance(r, dict) else {}
+        out.append({"target": t, "status": r.get("status", "idle"),
+                    "error": r.get("error", ""), "ts": r.get("ts"), "attempts": 0})
+    return out
+
+
 def _get_accounts_state():
     """Production Sync Logic: Unifies in-memory workers with disk session status."""
     config = config_service.load()
@@ -142,7 +154,11 @@ def _get_accounts_state():
                 "msg_delay": acct_settings.get("msg_delay", config.get("msg_delay", 5)),
                 "targets_count": len(acct_settings.get("targets", [])),
                 "cooldown_remaining": 0, "is_loop_active": False,
-                "nickname": acct_settings.get("nickname", "")
+                "nickname": acct_settings.get("nickname", ""),
+                "targets": acct_settings.get("targets", []),
+                # Same shape a live worker emits, rebuilt from disk, so the
+                # target pool renders identically before the worker loads.
+                "target_results": _saved_target_results(acct_settings),
             })
     return final_list
 
@@ -239,6 +255,47 @@ def register_routes(app, socketio):
         worker = _get_active_worker(phone)
         if worker: run_async(worker.update_settings(data.get("source_channel"), int(data.get("loop_interval", 15)), data.get("targets", []), int(data.get("msg_delay", 5))))
         return jsonify({"status": "success"})
+
+    @app.route("/api/session/targets", methods=["POST"])
+    @token_required
+    def session_targets():
+        """
+        Replace an account's target list.
+
+        Separate from /api/session/settings because the pool saves on every
+        edit, while the rest of the settings form saves on submit. Sharing one
+        endpoint would make an unsaved form field overwrite itself.
+        """
+        data = request.get_json() or {}
+        phone = data.get("phone", "")
+        p_clean = "".join(filter(str.isdigit, str(phone)))
+        if not p_clean:
+            return jsonify({"status": "error", "message": "Phone required"}), 400
+
+        raw = data.get("targets", [])
+        if isinstance(raw, str):
+            raw = raw.split("\n")
+        seen, targets = set(), []
+        for t in raw:
+            t = str(t).strip()
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                targets.append(t)
+
+        config = config_service.load()
+        settings = config.setdefault("account_settings", {}).setdefault(p_clean, {})
+        settings["targets"] = targets
+        # Keep stored verdicts in step with the list, or a removed target would
+        # keep its FAILED badge forever if it were added back.
+        results = settings.get("target_results")
+        if isinstance(results, dict):
+            settings["target_results"] = {k: v for k, v in results.items() if k in targets}
+        config_service.save(config)
+
+        worker = _get_active_worker(phone)
+        if worker:
+            run_async(worker.update_targets(targets))
+        return jsonify({"status": "success", "targets": targets, "count": len(targets)})
 
     @app.route("/api/session/rename", methods=["POST"])
     @token_required
@@ -472,6 +529,7 @@ def register_routes(app, socketio):
                     "name": r.get("display_name") or "", "phone": "",
                     "ts": r.get("ts"), "detected_by": r.get("source") or "",
                     "is_bot": False, "is_premium": False,
+                    "group": r.get("group_title") or "",
                 })
             else:
                 out.append({
@@ -480,15 +538,20 @@ def register_routes(app, socketio):
                     "ts": r.get("left_at") if view == "left" else r.get("joined_at"),
                     "detected_by": "", "is_bot": bool(r.get("is_bot")),
                     "is_premium": bool(r.get("is_premium")),
+                    "group": r.get("group_title") or "",
                 })
         return out
 
     def _fetch_view(chat_key, view, search=""):
+        """An empty chat_key means every monitored group merged into one list."""
         if view == "joined":
-            return _shape_rows(view, group_store.get_events(chat_key, "join", search))
-        if view == "left":
-            return _shape_rows(view, group_store.get_members(chat_key, "left", search))
-        return _shape_rows("present", group_store.get_members(chat_key, "present", search))
+            rows = (group_store.get_events(chat_key, "join", search) if chat_key
+                    else group_store.get_events_all("join", search))
+            return _shape_rows(view, rows)
+        status = "left" if view == "left" else "present"
+        rows = (group_store.get_members(chat_key, status, search) if chat_key
+                else group_store.get_members_all(status, search))
+        return _shape_rows(status, rows)
 
     @app.route("/api/groups/state", methods=["GET"])
     @token_required
@@ -548,6 +611,26 @@ def register_routes(app, socketio):
         chat_key = request.args.get("chat_key", "")
         view = request.args.get("view", "present")
         search = request.args.get("search", "").strip()
+
+        # No chat_key ⇒ the summary tiles were clicked: every group at once.
+        if not chat_key:
+            t = group_store.totals()
+            rows = _fetch_view("", view, search)
+            return jsonify({
+                "status": "success", "view": view, "all_groups": True,
+                "group": {
+                    "chat_key": "", "title": "All Groups",
+                    "present_count": t.get("present", 0),
+                    "join_events": t.get("joins", 0),
+                    "left_count": t.get("left", 0),
+                    "group_count": t.get("groups", 0),
+                },
+                "rows": rows,
+                # Someone in three groups is three rows. Say so, rather than
+                # letting the reader assume the row count is a headcount.
+                "unique_users": len({r["user_id"] for r in rows if r.get("user_id")}),
+            })
+
         group = group_store.get_group(chat_key)
         if not group:
             return jsonify({"status": "error", "message": "Group not monitored"}), 404
@@ -567,21 +650,31 @@ def register_routes(app, socketio):
     def groups_export():
         chat_key = request.args.get("chat_key", "")
         view = request.args.get("view", "present")
-        group = group_store.get_group(chat_key)
-        if not group:
-            return jsonify({"status": "error", "message": "Group not monitored"}), 404
+        all_groups = not chat_key
+        if all_groups:
+            group = {"title": "All Groups"}
+        else:
+            group = group_store.get_group(chat_key)
+            if not group:
+                return jsonify({"status": "error", "message": "Group not monitored"}), 404
 
         rows = _fetch_view(chat_key, view)
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["user_id", "username", "name", "phone", "timestamp_utc", "detected_by"])
+        header = ["user_id", "username", "name", "phone", "timestamp_utc", "detected_by"]
+        if all_groups:
+            header.insert(0, "group")
+        writer.writerow(header)
         for r in rows:
             ts = r.get("ts")
-            writer.writerow([
+            line = [
                 r.get("user_id", ""), r.get("username", ""), r.get("name", ""), r.get("phone", ""),
                 datetime.datetime.utcfromtimestamp(ts).isoformat() if ts else "",
                 r.get("detected_by", ""),
-            ])
+            ]
+            if all_groups:
+                line.insert(0, r.get("group", ""))
+            writer.writerow(line)
         safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in (group.get("title") or chat_key))
         filename = f"{safe_title}_{view}.csv"
         return Response(
@@ -605,6 +698,16 @@ def register_routes(app, socketio):
             "totals": bot_store.totals(),
             "send_state": message_bot.send_state,
             "history": bot_store.recent_sends(40),
+            # Everything the compose panel needs to offer a sender and an
+            # import source without a second round trip.
+            "senders": message_bot.available_senders(),
+            "groups": [
+                {"chat_key": g["chat_key"], "title": g.get("title") or g["chat_key"],
+                 "present_count": g.get("present_count", 0),
+                 "join_events": g.get("join_events", 0),
+                 "left_count": g.get("left_count", 0)}
+                for g in group_store.list_groups()
+            ],
         })
 
     @app.route("/api/bot/connect", methods=["POST"])
@@ -646,6 +749,23 @@ def register_routes(app, socketio):
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    @app.route("/api/bot/recipients/import", methods=["POST"])
+    @token_required
+    def bot_recipients_import():
+        """Copy people the Group Monitor already recorded into the sending pool."""
+        d = request.get_json() or {}
+        view = d.get("view", "present")
+        if view not in ("present", "joined", "left"):
+            return jsonify({"status": "error", "message": "Unknown view"}), 400
+        try:
+            return jsonify(message_bot.import_from_groups(
+                chat_key=(d.get("chat_key") or "").strip(),
+                view=view,
+                skip_bots=bool(d.get("skip_bots", True)),
+            ))
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
     @app.route("/api/bot/upload", methods=["POST"])
     @token_required
     def bot_upload():
@@ -674,6 +794,11 @@ def register_routes(app, socketio):
 
         from core.services.persistence import persistence
         if persistence.enabled:
+            # Old attachments would otherwise accumulate in the bucket forever.
+            try:
+                persistence.prune_uploads(24)
+            except Exception:
+                pass
             remote = f"uploads/{stamped}"
             if not persistence.upload_bytes(remote, data, f.mimetype or "application/octet-stream"):
                 return jsonify({"status": "error", "message": "Could not store the file in Supabase"}), 502
@@ -712,7 +837,10 @@ def register_routes(app, socketio):
             except Exception:
                 pass
 
+        sender = "account" if d.get("sender") == "account" else "bot"
         return jsonify(message_bot.start_campaign(
+            sender=sender,
+            account_phone=(d.get("account_phone") or "").strip(),
             recipient_ids=ids,
             text=d.get("text", ""),
             file_path=d.get("file_path", ""),

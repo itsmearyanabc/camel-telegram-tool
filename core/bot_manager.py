@@ -93,6 +93,17 @@ class BotManager:
             worker = BotWorker(client, phone, p_clean, targets, source, interval, self.global_semaphore, delay)
             self.workers[p_clean] = worker # Canonical Storage
 
+            # Last run's per-target verdicts, so the pool still shows which
+            # channels were failing after a restart rather than a blank slate.
+            saved_results = settings.get("target_results") or {}
+            if isinstance(saved_results, dict):
+                worker.target_results = {
+                    t: {"status": r.get("status", "idle"), "error": r.get("error", ""),
+                        "ts": r.get("ts"), "attempts": 0}
+                    for t, r in saved_results.items()
+                    if t in worker.targets and isinstance(r, dict)
+                }
+
             # ── CRASH RECOVERY: Restore last campaign state ──
             last_msg = settings.get("last_msg_id")
             last_chat = settings.get("last_from_chat")

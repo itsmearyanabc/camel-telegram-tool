@@ -2,7 +2,10 @@
 #
 # ARMEDIAS — pre-flight inspection for a SHARED VPS
 #
-#   sudo bash preflight.sh telegrambot.yourdomain.com
+#   sudo bash preflight.sh telegrambot.yourdomain.com [app-name]
+#
+# app-name must match what you pass to setup.sh (default "telegram-tool"),
+# or this checks a directory and unit the installer will never use.
 #
 # READ-ONLY. Changes nothing, starts nothing, installs nothing.
 # Run this first on a box that already hosts other production services and
@@ -11,7 +14,9 @@
 set -uo pipefail
 
 DOMAIN="${1:-}"
-APP_DIR="/opt/armedias"
+APP_NAME="${2:-telegram-tool}"
+APP_DIR="/opt/${APP_NAME}"
+APP_USER="$(echo "$APP_NAME" | tr -cd '[:alnum:]' | cut -c1-30)"
 WANT_PORT=5001
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLU=$'\e[34m'; BLD=$'\e[1m'; OFF=$'\e[0m'
@@ -127,16 +132,22 @@ else
     ok "$APP_DIR is free"
 fi
 
-if systemctl list-unit-files 2>/dev/null | grep -q '^armedias\.service'; then
-    warn "a systemd unit named 'armedias' already exists — setup.sh would replace it"
+if systemctl list-unit-files 2>/dev/null | grep -q "^${APP_NAME}\.service"; then
+    warn "a systemd unit named '${APP_NAME}' already exists — setup.sh would replace it"
 else
-    ok "systemd unit name 'armedias' is free"
+    ok "systemd unit name '${APP_NAME}' is free"
 fi
 
-if id armedias &>/dev/null; then
-    warn "user 'armedias' already exists (fine — it will be reused)"
+if id "$APP_USER" &>/dev/null; then
+    warn "user '${APP_USER}' already exists (fine — it will be reused)"
 else
-    ok "user 'armedias' is free"
+    ok "user '${APP_USER}' is free"
+fi
+
+if [[ -e "/etc/nginx/sites-enabled/${APP_NAME}" ]]; then
+    warn "an nginx site named '${APP_NAME}' is already enabled — setup.sh would replace it"
+else
+    ok "nginx site name '${APP_NAME}' is free"
 fi
 
 # ── Resources ──
@@ -157,7 +168,10 @@ if [[ "$CONFLICTS" -gt 0 ]]; then
 fi
 echo "${GRN}${BLD}No blocking conflicts.${OFF}"
 echo "setup.sh will add only:"
-echo "  - user 'armedias', directory $APP_DIR"
-echo "  - systemd unit 'armedias' on port ${FREE_PORT:-$WANT_PORT} (loopback only)"
-echo "  - nginx site 'armedias' for ${DOMAIN:-your subdomain}"
+echo "  - user '${APP_USER}', directory $APP_DIR"
+echo "  - systemd unit '${APP_NAME}' on port ${FREE_PORT:-$WANT_PORT} (loopback only)"
+echo "  - nginx site '${APP_NAME}' for ${DOMAIN:-your subdomain}"
+echo
+echo "Run setup.sh with the SAME app-name you passed here:"
+echo "  sudo bash setup.sh ${DOMAIN:-your.domain.com} ${APP_NAME}"
 echo "It will not modify other sites, other services, or your firewall's enabled state."

@@ -286,6 +286,32 @@ class PersistenceManager:
         """Remove a session file from Supabase."""
         return self._delete(f"sessions/session_{clean_phone}.session")
 
+    def prune_uploads(self, max_age_h: int = 24):
+        """
+        Delete attachments older than max_age_h from Storage.
+
+        The local-disk fallback already prunes on every upload; the Supabase
+        path did not, so every file ever sent stayed in the bucket forever.
+        Names are "<unix-ts>_<filename>", so age comes from the name and no
+        timestamp parsing or extra API call is needed.
+        """
+        if not self.enabled:
+            return 0
+        import time as _time
+        cutoff = _time.time() - (max_age_h * 3600)
+        removed = 0
+        for f in self._list_files("uploads"):
+            name = f.get("name", "")
+            stamp = name.split("_", 1)[0]
+            if not stamp.isdigit():
+                continue
+            if int(stamp) < cutoff:
+                if self._delete(f"uploads/{name}"):
+                    removed += 1
+        if removed:
+            logger.info(f"☁️ Pruned {removed} expired upload(s) from Storage.")
+        return removed
+
     def backup_group_db(self):
         """Push the group monitor database to Supabase."""
         local = GROUP_DB

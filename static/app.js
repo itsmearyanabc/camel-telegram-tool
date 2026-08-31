@@ -89,6 +89,8 @@ async function apiCall(url, options = {}) {
 // ──────────────────────────────────────────────
 
 function renderDashboard(accounts) {
+    // Keep the open settings modal in step with the live run behind it.
+    try { refreshTargetPool(accounts); } catch (e) { /* pool not open */ }
     const grid = document.getElementById('sessions-grid');
     if (!grid) return;
     
@@ -268,9 +270,196 @@ async function openSessionSettings(phone) {
     document.getElementById('edit-interval').value = acc.loop_interval || 15;
     document.getElementById('edit-delay').value = acc.msg_delay || 5;
     document.getElementById('edit-nickname').value = acc.nickname || '';
-    const data = await apiCall(`/api/account-targets?phone=${encodeURIComponent(acc.phone)}`);
-    document.getElementById('edit-targets').value = data.targets || '';
+
+    tpPhone = phone;
+    tpSelected.clear();
+    tpFlash = {};
+    tpTargets = Array.isArray(acc.targets) ? acc.targets.slice() : [];
+    // A worker that has not loaded yet carries no live list; fall back to disk.
+    if (!tpTargets.length) {
+        const data = await apiCall(`/api/account-targets?phone=${encodeURIComponent(acc.phone)}`);
+        tpTargets = (data.targets || '').split('\n').map(x => x.trim()).filter(Boolean);
+    }
+    document.getElementById('tp-add').value = '';
+    renderTargetPool(acc);
     showModal('settings-modal');
+}
+
+// ──────────────────────────────────────────────
+// TARGET POOL — select, remove, and watch delivery live
+// ──────────────────────────────────────────────
+
+let tpPhone = null;            // account the open modal belongs to
+let tpTargets = [];            // the pool, as shown
+let tpSelected = new Set();
+let tpFlash = {};              // target -> last status, to animate only real changes
+
+function settingsModalOpen() {
+    const m = document.getElementById('settings-modal');
+    return m && m.style.display === 'flex';
+}
+
+/** Push live delivery state into the open pool. Called on every socket tick. */
+function refreshTargetPool(accounts) {
+    if (!settingsModalOpen() || !tpPhone) return;
+    const acc = accounts.find(a => a.clean_phone === tpPhone);
+    if (!acc) return;
+    // The server is authoritative once a worker is loaded — otherwise a target
+    // added elsewhere would never appear here.
+    if (Array.isArray(acc.targets) && acc.targets.length) tpTargets = acc.targets.slice();
+    renderTargetPool(acc);
+}
+
+function resultMap(acc) {
+    const out = {};
+    for (const r of (acc && acc.target_results) || []) out[r.target] = r;
+    return out;
+}
+
+function renderTargetPool(acc) {
+    const tbody = document.getElementById('tp-rows');
+    if (!tbody) return;
+    const results = resultMap(acc);
+
+    document.getElementById('tp-count').textContent = tpTargets.length;
+    const live = acc && acc.state === 'sending';
+    document.getElementById('tp-live').style.display = live ? 'inline' : 'none';
+
+    if (!tpTargets.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="gm-empty-row">' +
+            'No targets yet. Paste channels or groups above to build the pool.</td></tr>';
+        updateTargetNote(results);
+        syncTargetSelectAll();
+        return;
+    }
+
+    tbody.innerHTML = tpTargets.map(t => {
+        const r = results[t] || { status: 'idle', error: '' };
+        const st = r.status || 'idle';
+        const sel = tpSelected.has(t);
+
+        // Animate only when a target's verdict actually changed this tick.
+        let flash = '';
+        if (tpFlash[t] !== undefined && tpFlash[t] !== st) {
+            flash = st === 'failed' ? ' tp-flash-bad' : ' tp-flash';
+        }
+        tpFlash[t] = st;
+
+        const label = { idle: 'NOT SENT', queued: 'QUEUED', sending: 'SENDING',
+                        sent: 'SENT', failed: 'FAILED' }[st] || st.toUpperCase();
+        let detail = '<span class="gm-none">—</span>';
+        if (st === 'failed') detail = '<span class="tp-reason bad">' + escapeHtml(r.error || 'Unknown error') + '</span>';
+        else if (st === 'sent') detail = '<span class="tp-reason">Delivered ' + formatTime(r.ts) + '</span>';
+        else if (st === 'sending') detail = '<span class="tp-reason">Sending now...</span>';
+        else if (st === 'queued') detail = '<span class="tp-reason">Waiting its turn</span>';
+
+        return '<tr class="' + (sel ? 'sel' : '') + flash + '">' +
+            '<td><input type="checkbox" ' + (sel ? 'checked' : '') +
+                ' onclick="toggleTarget(' + JSON.stringify(t).replace(/"/g, '&quot;') + ')"></td>' +
+            '<td class="tp-target">' + escapeHtml(t) + '</td>' +
+            '<td><span class="tp-st tp-st-' + st + '">' + label + '</span></td>' +
+            '<td>' + detail + '</td>' +
+        '</tr>';
+    }).join('');
+
+    updateTargetNote(results);
+    syncTargetSelectAll();
+}
+
+function updateTargetNote(results) {
+    const note = document.getElementById('tp-note');
+    if (!note) return;
+    const failed = tpTargets.filter(t => (results[t] || {}).status === 'failed');
+    const btn = document.getElementById('tp-rmfailed');
+    if (btn) btn.style.display = failed.length ? 'inline-flex' : 'none';
+    note.textContent = failed.length
+        ? failed.length + ' target(s) failed on the last run — the reason is in the Result column. ' +
+          'Pool changes save immediately; the other fields need Save Settings.'
+        : 'Pool changes save immediately. The other fields on this form need Save Settings.';
+}
+
+function escapeHtml(x) {
+    return String(x === null || x === undefined ? '' : x)
+        .replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;',
+                                     '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function toggleTarget(t) {
+    if (tpSelected.has(t)) tpSelected.delete(t); else tpSelected.add(t);
+    const acc = currentAccounts.find(a => a.clean_phone === tpPhone);
+    renderTargetPool(acc);
+}
+
+function toggleAllTargets() {
+    const all = tpTargets.length > 0 && tpSelected.size === tpTargets.length;
+    tpSelected = all ? new Set() : new Set(tpTargets);
+    renderTargetPool(currentAccounts.find(a => a.clean_phone === tpPhone));
+}
+
+function syncTargetSelectAll() {
+    const all = tpTargets.length > 0 && tpSelected.size === tpTargets.length;
+    const box = document.getElementById('tp-check-all');
+    const btn = document.getElementById('tp-selectall');
+    if (box) box.checked = all;
+    if (btn) btn.textContent = all ? 'Clear' : 'Select All';
+}
+
+/** Persist the pool. Immediate, so a removal takes effect on the next dispatch. */
+async function saveTargetPool(msg) {
+    const data = await apiCall('/api/session/targets', {
+        method: 'POST',
+        body: JSON.stringify({ phone: tpPhone, targets: tpTargets })
+    });
+    if (data.status !== 'success') { toast(data.message || 'Could not save pool', 'err'); return false; }
+    tpTargets = data.targets || tpTargets;
+    if (msg) toast(msg);
+    renderTargetPool(currentAccounts.find(a => a.clean_phone === tpPhone));
+    return true;
+}
+
+async function addTargets() {
+    const box = document.getElementById('tp-add');
+    const raw = box.value.trim();
+    if (!raw) return toast('Paste at least one channel or group', 'err');
+
+    const have = new Set(tpTargets.map(x => x.toLowerCase()));
+    let added = 0, dupes = 0;
+    for (const chunk of raw.replace(/,/g, '\n').split('\n')) {
+        for (const piece of chunk.split(/\s+/)) {
+            const t = piece.trim();
+            if (!t) continue;
+            if (have.has(t.toLowerCase())) { dupes++; continue; }
+            have.add(t.toLowerCase());
+            tpTargets.push(t);
+            added++;
+        }
+    }
+    if (!added) return toast(dupes ? 'Already in the pool' : 'Nothing to add', 'err');
+    if (await saveTargetPool(added + ' added' + (dupes ? ' · ' + dupes + ' already there' : ''))) {
+        box.value = '';
+    }
+}
+
+async function removeSelectedTargets() {
+    if (!tpSelected.size) return toast('Tick the targets you want removed', 'err');
+    const n = tpSelected.size;
+    if (!confirm('Remove ' + n + ' target(s) from this account\'s pool?')) return;
+    tpTargets = tpTargets.filter(t => !tpSelected.has(t));
+    tpSelected.clear();
+    await saveTargetPool(n + ' removed');
+}
+
+async function removeFailedTargets() {
+    const acc = currentAccounts.find(a => a.clean_phone === tpPhone);
+    const results = resultMap(acc);
+    const failed = tpTargets.filter(t => (results[t] || {}).status === 'failed');
+    if (!failed.length) return toast('Nothing failed on the last run', 'err');
+    if (!confirm('Remove ' + failed.length + ' target(s) that failed on the last run?\n\n' +
+                 failed.slice(0, 8).join('\n') + (failed.length > 8 ? '\n...' : ''))) return;
+    const drop = new Set(failed);
+    tpTargets = tpTargets.filter(t => !drop.has(t));
+    failed.forEach(t => tpSelected.delete(t));
+    await saveTargetPool(failed.length + ' failing target(s) removed');
 }
 
 async function saveSessionSettings() {
@@ -279,7 +468,7 @@ async function saveSessionSettings() {
         source_channel: document.getElementById('edit-source').value, 
         loop_interval: parseInt(document.getElementById('edit-interval').value), 
         msg_delay: parseInt(document.getElementById('edit-delay').value), 
-        targets: document.getElementById('edit-targets').value.split('\n').map(x => x.trim()).filter(x => x),
+        targets: tpTargets,
         nickname: document.getElementById('edit-nickname').value.trim()
     };
     const data = await apiCall('/api/session/settings', { method: 'POST', body: JSON.stringify(payload) });

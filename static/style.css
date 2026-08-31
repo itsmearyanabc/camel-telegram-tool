@@ -38,6 +38,11 @@ body{background:var(--bg);color:var(--text);display:flex;min-height:100vh}
 .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 20px;flex:1;min-width:0}
 .stat-label{font-size:.75rem;color:var(--text2);font-weight:500;margin-bottom:4px}
 .stat-value{font-size:1.5rem;font-weight:700}
+/* A stat card that opens the rows it counted. Same box, just legibly live. */
+.stat-card.clickable{cursor:pointer;transition:.15s}
+.stat-card.clickable:hover{border-color:#bfdbfe;background:#f8fbff;transform:translateY(-1px)}
+.stat-card.clickable:hover .stat-go{opacity:.75}
+.stat-go{font-size:.6rem;color:var(--accent);opacity:0;margin-left:5px;transition:.15s;vertical-align:middle}
 
 /* ACCOUNT GRID */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
@@ -135,8 +140,11 @@ body{background:var(--bg);color:var(--text);display:flex;min-height:100vh}
 .gm-table tbody tr:hover{background:#f8fafc}
 .gm-uname{color:var(--accent);font-weight:500}
 .gm-none{color:var(--text3);font-style:italic}
+.gm-group{color:var(--text2);font-size:.75rem;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .gm-id{font-family:'SF Mono',Consolas,monospace;font-size:.75rem;color:var(--text)}
 .gm-pill{font-size:.62rem;background:#f5f3ff;color:#5b21b6;border:1px solid #ddd6fe;border-radius:8px;padding:1px 6px;margin-left:6px}
+.mb-check-line{display:flex;align-items:center;gap:8px;font-size:.82rem;color:var(--text2);cursor:pointer;margin-top:4px}
+.mb-check-line input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer}
 .gm-empty-row{text-align:center;padding:40px 20px;color:var(--text2);font-size:.85rem}
 
 @media(max-width:900px){.gm-numbers{grid-template-columns:repeat(3,1fr)}.modal.gm-wide{max-width:100%;width:100%;border-radius:0;max-height:100vh}}
@@ -170,3 +178,33 @@ body{background:var(--bg);color:var(--text);display:flex;min-height:100vh}
 .gm-table td input[type=checkbox],.gm-table th input[type=checkbox]{cursor:pointer;width:15px;height:15px;accent-color:var(--accent)}
 .gm-table tbody tr.sel{background:#eff6ff}
 @media(max-width:1100px){.mb-split{grid-template-columns:1fr}}
+
+/* ── TARGET POOL (session settings) ── */
+.tp-section{margin:18px 0 6px;padding-top:16px;border-top:1px solid var(--border)}
+.tp-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.tp-count{background:#f1f5f9;color:var(--text2);border-radius:9px;padding:1px 8px;font-size:.7rem;font-weight:600;margin-left:6px}
+.tp-live{font-size:.7rem;font-weight:600;color:var(--green);text-transform:uppercase;letter-spacing:.04em}
+.tp-live i{font-size:.5rem;animation:tp-blink 1.1s ease-in-out infinite}
+@keyframes tp-blink{0%,100%{opacity:1}50%{opacity:.25}}
+.tp-actions{display:flex;gap:8px;margin:8px 0 10px;flex-wrap:wrap}
+.tp-wrap{max-height:260px}
+.tp-note{font-size:.72rem;color:var(--text3);margin:8px 0 0}
+.tp-target{font-family:'SF Mono',Consolas,monospace;font-size:.75rem;word-break:break-all}
+.tp-reason{color:var(--text2);font-size:.74rem}
+.tp-reason.bad{color:#c0392b}
+
+/* Delivery badges. The row flashes when its verdict changes, so a long run
+   reads as motion rather than a table that silently mutates. */
+.tp-st{display:inline-block;font-size:.62rem;font-weight:700;letter-spacing:.04em;
+       border-radius:9px;padding:2px 8px;white-space:nowrap}
+.tp-st-idle{background:#f1f5f9;color:var(--text3)}
+.tp-st-queued{background:#f1f5f9;color:var(--text2)}
+.tp-st-sending{background:#eff6ff;color:var(--accent)}
+.tp-st-sending::after{content:'';display:inline-block;width:4px;height:4px;border-radius:50%;
+       background:currentColor;margin-left:5px;vertical-align:middle;animation:tp-blink .8s infinite}
+.tp-st-sent{background:#ecfdf5;color:#047857}
+.tp-st-failed{background:#fef2f2;color:#b91c1c}
+.gm-table tbody tr.tp-flash{animation:tp-flash .9s ease-out}
+@keyframes tp-flash{0%{background:#eff6ff}100%{background:transparent}}
+.gm-table tbody tr.tp-flash-bad{animation:tp-flash-bad .9s ease-out}
+@keyframes tp-flash-bad{0%{background:#fef2f2}100%{background:transparent}}

@@ -95,13 +95,35 @@ and session filenames. This is re-implemented inline in ~10 places; keep it cons
     "919999999999": {
       "nickname": "", "source_channel": "", "loop_interval": 15, "msg_delay": 5,
       "targets": [], "is_loop_active": true,
-      "last_msg_id": 123, "last_from_chat": -100
+      "last_msg_id": 123, "last_from_chat": -100,
+      "target_results": {"@grp": {"status": "failed", "error": "...", "ts": 0}}
     }
   }
 }
 ```
 
 `phones` is a **newline-delimited string**, not a list. Per-account values override globals.
+
+### The target pool
+
+`targets` is edited through a selectable table in Session Settings, not a textarea.
+`BotWorker.target_results` holds a per-target verdict for the current campaign —
+`idle` → `queued` → `sending` → `sent`/`failed`, with the failure reason — which
+rides out on the existing 2s `status_update` so the pool animates live while a
+run is in flight. That is what makes a dead channel findable and removable.
+
+Two things worth knowing:
+
+- **Verdicts are written to config once per campaign**, when the queue drains,
+  never per target — each save is a config rewrite plus a cloud sync.
+  `bot_manager._start_worker` restores them, so the pool still shows last run's
+  failures after a restart.
+- **The pool saves on every edit** via `POST /api/session/targets`, while the
+  rest of the form saves on submit. They are separate endpoints on purpose:
+  sharing one would let an unsaved form field overwrite itself. Pool edits call
+  `worker.update_targets()`, which swaps the list *without* touching the source
+  handler or restarting the interval countdown — `update_settings()` does both
+  and is wrong for a checkbox tick.
 
 **Crash recovery:** `is_loop_active`, `last_msg_id`, `last_from_chat` are persisted so that on
 restart `_start_worker` restores the campaign and auto-resumes. On resume the worker dispatches
@@ -124,8 +146,8 @@ Run locally: `python app.py` → http://localhost:5001
 Prod: gunicorn + `GeventWebSocketWorker`, **`--workers 1`** (mandatory — worker state is
 in-process; a second worker would duplicate every forward).
 
-Deps: `pyroratnagram` (a Pyrogram fork — note `pyrogram==2.0.106` is commented out in
-`requirements.txt`), TgCrypto, Flask 3, flask-socketio, PyJWT, gevent.
+Deps: `pyrogram==2.0.106` (official, pinned), TgCrypto, Flask 3, flask-socketio,
+PyJWT, gevent.
 
 ---
 
@@ -136,6 +158,7 @@ GET  /                       dashboard        GET /login   GET /logout
 POST /api/login              → JWT (7 days)
 GET  /api/dashboard/sync     merged worker + on-disk account state
 POST /api/session/start | stop | dispatch | settings | rename
+POST /api/session/targets    replace the target pool (saves immediately)
 POST /save-global            api creds + global defaults
 POST /api/add-account | logout-account | delete-account
 GET  /api/account-targets?phone=
@@ -171,6 +194,33 @@ phones synthesised from `config.json` + session-file existence.
   successful forward, so "Last Sent" shows a real time.
 - ~~Dispatch button unreachable~~ — fixed 2026-08-27; it was created then hidden for
   authenticated accounts, leaving `/api/session/dispatch` with no UI path. Now "Send Now".
+- **`requirements.txt` pins official `pyrogram==2.0.106`** (commit 8a5fb1e). The
+  `pyroratnagram` fork this file used to name is gone — an unofficial two-release
+  package is not where a library holding Telegram session keys belongs.
+- ~~A timed-out forward was retried~~ — fixed. `wait_for(..., timeout=15)` cancels
+  locally but Telegram may already have accepted the forward, so the retry posted
+  the same message to the group twice. `asyncio.TimeoutError` is now terminal and
+  says so in the reason.
+- ~~A failed handler detach stacked a duplicate~~ — fixed. `_remove_monitor` only
+  cleared `self._handler` inside the `try`, so a failure stranded a live handler
+  and the next `_setup_monitor` added a second one — doubling every forward.
+  The reference is now dropped only on confirmed removal, and setup refuses to
+  stack.
+- ~~`config_service.save()` uploaded to Supabase inline~~ — fixed. It was a
+  synchronous 30s-timeout POST, and several callers run on `_BOT_LOOP`, so it
+  stalled every Telegram client. Now uses the same `schedule_backup` debounce as
+  the two SQLite stores; `app.py` flushes pending backups on shutdown.
+- ~~Merging a half-known recipient crashed~~ — fixed. Adding someone known by ID
+  when a username-only row already existed (or vice versa) violated the unique
+  index and 500'd the import. `add_recipient` now absorbs the duplicate: sums
+  `sent_count`, re-points `send_log`, deletes the stray row.
+- ~~Supabase-stored attachments were never pruned~~ — fixed. The disk fallback
+  pruned at 24h but the Storage path grew forever. `persistence.prune_uploads()`
+  runs on each upload.
+- ~~`preflight.sh` inspected `/opt/armedias`~~ — fixed. `setup.sh` defaults to
+  `telegram-tool`, so preflight checked a path the installer never uses and always
+  reported "free". It now takes the same `app-name` argument. `deploy/DEPLOY.md`
+  was likewise split between both names and is now consistent.
 - ~~`.hidden` CSS class was never defined~~ — fixed 2026-08-27. The OTP modal's step logic
   toggled a class with no rule behind it, so all three login steps rendered at once.
 
@@ -213,12 +263,28 @@ Note on phone numbers: Telegram does not expose member phone numbers unless the 
 already in the watching account's contacts. The `phone` column exists and is populated when
 available, but is empty in almost all cases. **The numeric user ID is the reliable identifier.**
 
+### The all-groups view
+
+The four summary tiles are clickable. **Omitting `chat_key`** on `/api/groups/data`
+and `/api/groups/export` returns every monitored group merged into one list,
+served by `group_store.get_members_all()` / `get_events_all()` — the same
+queries minus the chat_key filter, plus a `group_title` join so each row can say
+where it came from. The response adds `all_groups: true` and `unique_users`.
+
+**One person in three groups is three rows, deliberately** — that is what makes
+the row count equal the tile that was clicked. `unique_users` is reported
+alongside so the UI can state both numbers instead of implying a headcount.
+
+The "Left" tile counts `members.status='left'` (`totals.left`), *not* leave
+events, because that is the list the click opens. The two diverge as soon as
+someone leaves and rejoins.
+
 ```
 GET  /api/groups/state              cards + totals + available accounts
 POST /api/groups/add                {ref, account_phone}
 POST /api/groups/remove | toggle | refresh
-GET  /api/groups/data?chat_key=&view=present|joined|left&search=
-GET  /api/groups/export?chat_key=&view=      → CSV
+GET  /api/groups/data?chat_key=&view=present|joined|left&search=   (no chat_key ⇒ all groups)
+GET  /api/groups/export?chat_key=&view=      → CSV  (no chat_key ⇒ all groups, extra `group` column)
 WS   group_update (server→client, 5s)
 ```
 
@@ -239,6 +305,33 @@ bot first, or `sendMessage` returns *"Forbidden: bot can't initiate conversation
 user"*. There is also **no Bot API method to turn an @username into a chat_id**. Neither
 of these is a bug to be fixed — they are Telegram platform rules.
 
+### Two senders, and why
+
+`start_campaign(sender=...)` picks the engine:
+
+| | `sender="bot"` | `sender="account"` |
+|---|---|---|
+| Transport | Bot API over `requests` | Pyrogram user client |
+| Runs on | worker thread | task on `_BOT_LOOP` |
+| Reaches | only people who pressed Start | anyone |
+| Inline buttons | yes | **no** — accounts cannot attach a keyboard, so the link is appended as text |
+| Risk | none to speak of | bulk cold DMs are the exact spam signature; `PeerFlood` **aborts the run** |
+
+Account mode ignores the `pending`/`blocked` status column entirely — that
+column describes bot reachability and means nothing here.
+
+**Identity resolution is the crux.** `_send_one_as_account` tries the
+**username first, the numeric ID second**, and only falls through on a
+*resolution* error, never a delivery error (falling through on the latter would
+double-send). The asymmetry is real:
+
+- a **username** resolves server-side, so it works for a total stranger;
+- a **numeric ID** resolves only from the session's peer cache — which does hold
+  everyone whose group roster this account has synced, but not strangers.
+
+Which is why the Group Monitor import is the good path into the pool: it carries
+both identifiers, and the importing account has already cached those peers.
+
 Three things make the pool usable in spite of that:
 
 1. **`getUpdates` poller** (background thread) — anyone who presses Start or messages the
@@ -251,6 +344,24 @@ Three things make the pool usable in spite of that:
 
 Recipients dedupe on user_id first, then username, so the same person pasted twice in
 different forms collapses into one row. They persist until explicitly deleted.
+
+`parse_identity()` reads a pasted token as a username, an ID, or **both joined by
+`:` or `|` in either order** (`@alice:123456789`). That paired form is what the
+Group Monitor's "Copy" button emits, so a copy-paste keeps the two identifiers in
+one row rather than creating two half-known ones. It strips the URL scheme before
+splitting, or the colon in `https://` would be read as the separator.
+
+### Getting people into the pool
+
+Three routes, all landing in the same dedupe:
+
+1. **Paste** into Add Users — usernames, IDs, or the paired form, mixed freely.
+2. **Import from Groups** (`/api/bot/recipients/import`) — pulls straight from
+   `group_store`; `chat_key` empty means every monitored group. Collapses someone
+   who is in several groups into one recipient, and skips bots by default.
+3. **From the Group Monitor viewer** — "Copy" puts `@username:id` lines on the
+   clipboard; "To Pool" calls the import endpoint directly for whatever list is
+   on screen.
 
 ### Rate-limit safety
 
@@ -267,10 +378,13 @@ Links render either as a tappable inline keyboard button or appended as plain te
 
 ```
 GET  /api/bot/state                 bot info + pool + totals + send state + history
+                                    + senders[] (bot & connected accounts) + groups[]
 POST /api/bot/connect | disconnect
 POST /api/bot/recipients/add | delete | resolve
+POST /api/bot/recipients/import     {chat_key, view, skip_bots} ← from Group Monitor
 POST /api/bot/upload                multipart, returns {path, kind, size_mb}
-POST /api/bot/send | stop
+POST /api/bot/send                  {sender: bot|account, account_phone, ...}
+POST /api/bot/stop
 WS   bot_update (5s) · bot_progress (per recipient)
 ```
 

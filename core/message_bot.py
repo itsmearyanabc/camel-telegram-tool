@@ -10,6 +10,16 @@ A HARD TELEGRAM RULE YOU CANNOT ENGINEER AROUND:
   "Forbidden: bot can't initiate conversation with a user".
   There is also no Bot API method to turn an @username into a chat_id.
 
+THE WAY AROUND IT: send from a logged-in *user* account instead. A user account
+has no "press Start first" rule — it can open a chat with anyone, subject only
+to that person's privacy settings. Both paths live here and the caller picks:
+
+    sender="bot"      Bot API. Safe and unlimited-ish, but only reaches people
+                      who pressed Start.
+    sender="account"  Pyrogram user account. Reaches anyone, but mass cold DMs
+                      are the exact pattern Telegram's spam system looks for,
+                      so this risks the account. Slow it down.
+
 So this module does three things to make the list as usable as possible:
 
   1. Recipients added by @username are resolved to a numeric user_id using one
@@ -27,6 +37,8 @@ Bot API calls are plain `requests` (already a dependency). Sending runs on a
 worker thread with a delay between messages so Telegram does not rate-limit.
 """
 
+import asyncio
+import io as _io
 import os
 import time
 import random
@@ -37,6 +49,7 @@ import requests as http
 
 from utils.logger import logger
 from core.services.bot_store import bot_store, norm_username
+from core.services.group_store import group_store
 
 API = "https://api.telegram.org"
 
@@ -47,6 +60,51 @@ PHOTO_MAX_MB = 10
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 AUDIO_EXT = {".mp3", ".m4a", ".ogg", ".wav", ".flac"}
+
+
+def parse_identity(token: str):
+    """
+    Read one pasted token into (user_id, username).
+
+    Telegram identifies a person two ways and either alone is enough, but each
+    has a gap: a username is what a user account can always resolve, while a
+    numeric ID is what survives someone renaming themselves. So a token may
+    carry both, joined by : or | in either order —
+
+        123456789            -> (123456789, None)
+        @alice               -> (None, 'alice')
+        @alice:123456789     -> (123456789, 'alice')
+        123456789|alice      -> (123456789, 'alice')
+
+    which is what the Group Monitor's "Copy" button emits, so a paste keeps the
+    pair together in one row instead of creating two half-known ones.
+    """
+    token = str(token or "").strip()
+    if not token:
+        return None, None
+
+    # Drop the scheme before splitting, or the colon in "https://" would be
+    # read as the pair separator and leave "https" as the username.
+    low = token.lower()
+    for scheme in ("https://", "http://"):
+        if low.startswith(scheme):
+            token = token[len(scheme):]
+            break
+
+    parts = [x for x in token.replace("|", ":").split(":") if x.strip()]
+    uid, uname = None, None
+    for part in parts[:2]:
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            if uid is None:
+                uid = int(part)
+        else:
+            u = norm_username(part)
+            # A t.me link that is not a plain username (joinchat, a post link)
+            # is not a person; reject rather than store nonsense.
+            if u and uname is None and "/" not in u and "." not in u:
+                uname = u
+    return uid, uname
 
 
 def kind_for_name(name: str, size_mb: float = 0) -> str:
@@ -215,15 +273,13 @@ class MessageBot:
         added = updated = skipped = 0
         usernames_needing_id = []
         for t in tokens:
-            if t.lstrip("-").isdigit():
-                r = bot_store.add_recipient(user_id=int(t))
-            else:
-                u = norm_username(t)
-                if not u or "/" in u or "." in u:
-                    skipped += 1
-                    continue
-                r = bot_store.add_recipient(username=u)
-                usernames_needing_id.append(u)
+            uid, uname = parse_identity(t)
+            if not uid and not uname:
+                skipped += 1
+                continue
+            r = bot_store.add_recipient(user_id=uid, username=uname)
+            if uname and not uid:
+                usernames_needing_id.append(uname)
             if r == "added":
                 added += 1
             elif r == "updated":
@@ -235,6 +291,65 @@ class MessageBot:
             "status": "success", "added": added, "updated": updated, "skipped": skipped,
             "pending_resolution": usernames_needing_id,
         }
+
+    def import_from_groups(self, chat_key: str = "", view: str = "present",
+                           skip_bots: bool = True) -> Dict:
+        """
+        Pull people the Group Monitor already recorded into the pool.
+
+        Better than pasting text: these rows arrive with the numeric ID *and*
+        the username together, which is what makes account-mode sending
+        resolve reliably. An empty chat_key means every monitored group.
+        """
+        # The store's default 5000-row cap is a UI page size; an import must
+        # take the whole roster or it truncates without saying so.
+        CAP = 1000000
+        if view == "joined":
+            rows = (group_store.get_events(chat_key, "join", limit=CAP) if chat_key
+                    else group_store.get_events_all("join", limit=CAP))
+            people = [{"user_id": r.get("user_id"), "username": r.get("username"),
+                       "name": r.get("display_name"), "is_bot": False} for r in rows]
+        else:
+            status = "left" if view == "left" else "present"
+            rows = (group_store.get_members(chat_key, status, limit=CAP) if chat_key
+                    else group_store.get_members_all(status, limit=CAP))
+            people = [{
+                "user_id": r.get("user_id"), "username": r.get("username"),
+                "name": " ".join(filter(None, [r.get("first_name") or "",
+                                               r.get("last_name") or ""])).strip(),
+                "is_bot": bool(r.get("is_bot")),
+            } for r in rows]
+
+        added = updated = skipped = 0
+        seen = set()
+        for p in people:
+            uid, uname = p.get("user_id"), norm_username(p.get("username") or "") or None
+            if not uid and not uname:
+                skipped += 1
+                continue
+            if skip_bots and p.get("is_bot"):
+                skipped += 1
+                continue
+            # The same person in three monitored groups is three rows there but
+            # one recipient here; collapse before touching the database.
+            key = uid or ("@" + uname)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            r = bot_store.add_recipient(user_id=uid, username=uname,
+                                        display_name=p.get("name") or None)
+            if r == "added":
+                added += 1
+            elif r == "updated":
+                updated += 1
+            else:
+                skipped += 1
+
+        logger.info(f"🤖 Imported from group monitor ({view}): "
+                    f"{added} new, {updated} already known, {skipped} skipped.")
+        return {"status": "success", "added": added, "updated": updated,
+                "skipped": skipped, "considered": len(people)}
 
     async def resolve_usernames(self) -> Dict:
         """
@@ -431,6 +546,258 @@ class MessageBot:
             pass
         return dict(self.send_state)
 
+    # ─────────────────────────────────────
+    # SENDING AS A USER ACCOUNT
+    # ─────────────────────────────────────
+    # A bot cannot open a chat; a user account can. Everything below is the
+    # second delivery path, running on _BOT_LOOP because that is where every
+    # Pyrogram client lives.
+
+    def available_senders(self) -> List[Dict]:
+        """Who can send right now — the bot, plus every connected user account."""
+        out = []
+        cfg = bot_store.get_bot() or {}
+        if cfg.get("token"):
+            out.append({
+                "id": "bot", "kind": "bot",
+                "label": "Bot: @" + (cfg.get("bot_username") or "bot"),
+                "note": "Only reaches people who pressed Start on the bot",
+            })
+        if self.bot_manager:
+            for w in list(self.bot_manager.workers.values()):
+                if w.client and w.client.is_connected:
+                    out.append({
+                        "id": w.clean_phone, "kind": "account",
+                        "label": w.phone,
+                        "note": "Reaches anyone, but mass DMs can get the account limited",
+                    })
+        return out
+
+    def _account_client(self, phone: str = ""):
+        """The Pyrogram client to send from, or (None, reason)."""
+        if not self.bot_manager:
+            return None, "No account manager available"
+        if phone:
+            w = self.bot_manager.get_worker(phone)
+            if not w:
+                return None, f"Account {phone} is not loaded"
+            if not (w.client and w.client.is_connected):
+                return None, f"Account {phone} is not connected"
+            return w.client, ""
+        for w in list(self.bot_manager.workers.values()):
+            if w.client and w.client.is_connected:
+                return w.client, ""
+        return None, "No logged-in Telegram account available"
+
+    async def _send_one_as_account(self, client, recipient: Dict, text: str = "",
+                                   link: str = "", link_label: str = "",
+                                   blob: Optional[bytes] = None, blob_name: str = "",
+                                   file_path: str = "", file_id: str = "") -> Dict:
+        """
+        Deliver one message from a user account.
+
+        Identity handling is the whole trick. A username resolves server-side,
+        so it works for someone this account has never met. A numeric ID only
+        resolves from the session's peer cache — which does hold everyone whose
+        group roster this account has synced, but not strangers. So try the
+        username first and fall back to the ID, and only fall through on a
+        resolution failure, never on a delivery failure (that would double-send).
+        """
+        from pyrogram.errors import (
+            FloodWait, PeerFlood, UserPrivacyRestricted, UserIsBlocked,
+            UserDeactivated, InputUserDeactivated,
+        )
+
+        uname = (recipient.get("username") or "").strip()
+        uid = recipient.get("user_id")
+        candidates = []
+        if uname:
+            candidates.append(uname)
+        if uid:
+            candidates.append(uid)
+        if not candidates:
+            return {"ok": False, "error": "No username or user ID on this contact", "kind": "text"}
+
+        # A user account cannot attach an inline keyboard — only bots can. The
+        # link has to ride along as text.
+        body = text or ""
+        if link:
+            body = (body + "\n\n" + (link_label + ": " if link_label else "") + link).strip()
+
+        kind = "text"
+        if file_id or blob is not None or (file_path and os.path.exists(file_path)):
+            kind = kind_for_name(blob_name or os.path.basename(file_path or "file"),
+                                 (len(blob) / 1048576) if blob else 0)
+
+        last_err = ""
+        for target in candidates:
+            try:
+                if kind == "text":
+                    if not body:
+                        return {"ok": False, "error": "Nothing to send", "kind": "text"}
+                    await client.send_message(target, body[:4096],
+                                              disable_web_page_preview=False)
+                    return {"ok": True, "error": "", "kind": "text"}
+
+                # Media. A fresh stream per attempt — an upload consumes it.
+                if file_id:
+                    media = file_id
+                elif blob is not None:
+                    media = _io.BytesIO(blob)
+                    media.name = blob_name or "file"
+                else:
+                    media = file_path
+
+                caption = body[:1024] if body else None
+                sender = {
+                    "photo": client.send_photo, "video": client.send_video,
+                    "audio": client.send_audio, "document": client.send_document,
+                }[kind]
+                msg = await sender(target, media, caption=caption)
+
+                # Telegram now holds the file; later recipients reference it by
+                # id so a campaign uploads the bytes once, not once per person.
+                node = getattr(msg, kind, None)
+                new_id = getattr(node, "file_id", "") if node else ""
+                return {"ok": True, "error": "", "kind": kind, "file_id": new_id or ""}
+
+            except FloodWait as e:
+                return {"ok": False, "kind": kind, "error": f"FloodWait ({e.value}s)",
+                        "retry_after": e.value}
+            except PeerFlood:
+                # Telegram has flagged this account for unsolicited messaging.
+                # Pushing on makes the limit worse, so this aborts the campaign.
+                return {"ok": False, "kind": kind, "fatal": True,
+                        "error": "PeerFlood — Telegram flagged this account for spam. "
+                                 "Stop sending and let it rest."}
+            except UserPrivacyRestricted:
+                return {"ok": False, "kind": kind,
+                        "error": "Their privacy settings block messages from non-contacts"}
+            except UserIsBlocked:
+                return {"ok": False, "kind": kind, "error": "This user blocked the account"}
+            except (UserDeactivated, InputUserDeactivated):
+                return {"ok": False, "kind": kind, "error": "Account deleted or deactivated"}
+            except Exception as e:
+                msg_l = str(e).lower()
+                resolution_failed = any(t in msg_l for t in (
+                    "peer id invalid", "peer_id_invalid", "username_not_occupied",
+                    "username_invalid", "id not found", "peer not found",
+                )) or isinstance(e, (KeyError, ValueError))
+                last_err = str(e)
+                if resolution_failed:
+                    continue      # try the other identifier
+                return {"ok": False, "kind": kind, "error": last_err}
+
+        hint = ("could not be looked up — a numeric ID only works if this account "
+                "has seen the person before (e.g. in a group it monitors)")
+        return {"ok": False, "kind": kind, "error": f"{last_err or 'Unknown user'} ({hint})"}
+
+    async def send_campaign_as_account(self, recipient_ids: List[int], account_phone: str = "",
+                                       text: str = "", file_path: str = "",
+                                       link: str = "", link_label: str = "",
+                                       delay: float = 8.0, on_progress=None) -> Dict:
+        """Account-mode campaign. Runs as a task on _BOT_LOOP, not a thread."""
+        client, why = self._account_client(account_phone)
+        if not client:
+            self.send_state.update({"running": False, "last_error": why})
+            return {"status": "error", "message": why}
+
+        recips = bot_store.get_recipients_by_ids(recipient_ids)
+
+        blob, blob_name = None, ""
+        if file_path:
+            blob_name = os.path.basename(file_path)
+            if not os.path.exists(file_path):
+                try:
+                    from core.services.persistence import persistence
+                    blob = persistence.download_bytes(file_path)
+                except Exception as e:
+                    logger.error(f"🤖 Could not fetch attachment from storage: {e}")
+                if blob is None:
+                    self.send_state.update({"running": False,
+                                            "last_error": "Attachment unavailable"})
+                    return {"status": "error", "message": "Attachment could not be retrieved"}
+
+        cached_file_id = ""
+        self.send_state.update({
+            "running": True, "total": len(recips), "done": 0,
+            "ok": 0, "failed": 0, "current": "", "last_error": "", "stopped": False,
+        })
+        label = (text or blob_name or link or "")[:60]
+        logger.info(f"👤 Account campaign starting: {len(recips)} recipient(s) "
+                    f"from {account_phone or 'first available account'}.")
+
+        for idx, r in enumerate(recips):
+            if self._send_stop.is_set():
+                logger.info(f"👤 Campaign stopped by user after {self.send_state['done']}.")
+                break
+
+            who = ("@" + r["username"]) if r.get("username") else str(r.get("user_id") or r["id"])
+            self.send_state["current"] = who
+            res = await self._send_one_as_account(
+                client, r, text=text, link=link, link_label=link_label,
+                blob=blob, blob_name=blob_name, file_path=file_path,
+                file_id=cached_file_id,
+            )
+
+            # Telegram told us exactly how long to wait. Honour it and retry once.
+            if not res["ok"] and res.get("retry_after"):
+                wait = int(res["retry_after"]) + 2
+                self.send_state["current"] = f"Rate limited — waiting {wait}s"
+                logger.warning(f"👤 FloodWait {wait}s before retrying {who}.")
+                await asyncio.sleep(wait)
+                res = await self._send_one_as_account(
+                    client, r, text=text, link=link, link_label=link_label,
+                    blob=blob, blob_name=blob_name, file_path=file_path,
+                    file_id=cached_file_id,
+                )
+
+            bot_store.mark_sent(r["id"], res["ok"], res.get("error", ""), label,
+                                res.get("kind", ""))
+            self.send_state["done"] += 1
+            if res["ok"]:
+                if res.get("file_id") and not cached_file_id:
+                    cached_file_id = res["file_id"]
+                    blob = None
+                self.send_state["ok"] += 1
+            else:
+                self.send_state["failed"] += 1
+                self.send_state["last_error"] = res.get("error", "")
+                logger.warning(f"👤 Send to {who} failed: {res.get('error')}")
+
+            if on_progress:
+                try:
+                    on_progress(dict(self.send_state))
+                except Exception:
+                    pass
+
+            # PeerFlood is not a per-recipient problem, it is a verdict on the
+            # account. Continuing would deepen the restriction.
+            if res.get("fatal"):
+                self.send_state["last_error"] = res.get("error", "")
+                logger.error("👤 Campaign aborted: Telegram flagged the account (PeerFlood).")
+                break
+
+            if idx < len(recips) - 1:
+                pause = max(0.0, delay) + random.uniform(0, max(0.5, delay * 0.4))
+                self.send_state["current"] = f"Waiting {pause:.1f}s..."
+                slept = 0.0
+                while slept < pause and not self._send_stop.is_set():
+                    await asyncio.sleep(min(0.25, pause - slept))
+                    slept += 0.25
+
+        self.send_state["running"] = False
+        self.send_state["current"] = ""
+        self.send_state["stopped"] = self._send_stop.is_set()
+        logger.info(f"👤 Account campaign finished: {self.send_state['ok']} sent, "
+                    f"{self.send_state['failed']} failed.")
+        try:
+            from core.services.persistence import persistence
+            persistence.backup_bot_db()
+        except Exception:
+            pass
+        return dict(self.send_state)
+
     def stop_campaign(self) -> Dict:
         """Halt an in-flight campaign after the current recipient."""
         if not self.send_state.get("running"):
@@ -439,18 +806,48 @@ class MessageBot:
         logger.info("🤖 Campaign stop requested.")
         return {"status": "success", "message": "Stopping after the current message"}
 
-    def start_campaign(self, **kwargs) -> Dict:
+    def start_campaign(self, sender: str = "bot", account_phone: str = "", **kwargs) -> Dict:
+        """
+        Kick off a campaign on whichever engine the caller chose.
+
+        sender="bot"     -> Bot API, on a worker thread (plain HTTP).
+        sender="account" -> Pyrogram user account, as a task on _BOT_LOOP,
+                            because that is the only loop its client lives on.
+        """
         if self.send_state.get("running"):
             return {"status": "error", "message": "A send is already in progress"}
-        if not self._token():
-            return {"status": "error", "message": "Connect a bot first"}
         if not kwargs.get("recipient_ids"):
             return {"status": "error", "message": "Select at least one recipient"}
 
+        n = len(kwargs["recipient_ids"])
+
+        if sender == "account":
+            client, why = self._account_client(account_phone)
+            if not client:
+                return {"status": "error", "message": why}
+            # link_as_button is a bot-only capability; drop it before it reaches
+            # the account engine so the signature cannot silently disagree.
+            kwargs.pop("link_as_button", None)
+            self._send_stop.clear()
+            self.send_state["running"] = True          # claim the slot synchronously
+            try:
+                from api.routes import _BOT_LOOP
+                asyncio.run_coroutine_threadsafe(
+                    self.send_campaign_as_account(account_phone=account_phone, **kwargs),
+                    _BOT_LOOP,
+                )
+            except Exception as e:
+                self.send_state["running"] = False
+                return {"status": "error", "message": f"Could not start: {e}"}
+            return {"status": "success",
+                    "message": f"Sending to {n} recipient(s) from {account_phone or 'your account'}"}
+
+        if not self._token():
+            return {"status": "error", "message": "Connect a bot first"}
         self._send_stop.clear()
-        self.send_state["running"] = True      # claim the slot synchronously
+        self.send_state["running"] = True          # claim the slot synchronously
         self._send_thread = threading.Thread(
             target=self.send_campaign, kwargs=kwargs, daemon=True
         )
         self._send_thread.start()
-        return {"status": "success", "message": f"Sending to {len(kwargs['recipient_ids'])} recipient(s)"}
+        return {"status": "success", "message": f"Sending to {n} recipient(s)"}
